@@ -14,6 +14,9 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);  
   digitalWrite(LED_PIN, LOW);
 
+  // 🔽 Ajoute cette ligne pour activer le pull-up interne sur RECV_PIN
+  pinMode(RECV_PIN, INPUT_PULLUP);
+
   irrecv.enableIRIn();       // Active la réception
   Serial.println("Récepteur IR prêt");
 }
