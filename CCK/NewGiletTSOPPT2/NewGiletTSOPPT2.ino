@@ -8,10 +8,8 @@
 #include <string>
 #include <DFRobotDFPlayerMini.h>
 
-// ===== IR (TSOP + IRremoteESP8266) =====
-#include <IRremoteESP8266.h>
-#include <IRrecv.h>
-#include <IRutils.h>
+// ===== IR (TSOP + Arduino-IRremote) =====
+#include <IRremote.hpp>
 
 // ---------- Wi-Fi ----------
 const char* ssid          = "PelucheGang";
@@ -22,7 +20,7 @@ const char* mqtt_password = "DjioopPod";
 
 // ---------- IDs / IO ----------
 const int MOTOR_PIN = 13; // GPIO13 = D13 sur beaucoup de cartes ESP32
-const char* esp32_id = "Player4"; // Identifiant unique pour cet ESP32
+const char* esp32_id = "Player0"; // Identifiant unique pour cet ESP32
 
 // ---------- États jeu ----------
 bool  invulnerable   = false;
@@ -37,19 +35,19 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 // ---------- TSOP / IRremote ----------
-static const uint8_t  RECV_PIN = 15;             // Entrée TSOP
-static const uint32_t KILLER_CODE = 0xA90;       // À adapter exactement au code lampe
-static const bool     ACCEPT_ANY_CODE = false;   // true pour debug (accepte tout)
-static const uint8_t  RECV_PIN_MODE = INPUT;     // passer à INPUT_PULLUP si besoin
 
-IRrecv irrecv(RECV_PIN);
-decode_results results;
+static const uint8_t RECV_PIN = 15;   // TSOP sur GPIO15
+// static const uint32_t KILLER_CODE = 0xA90;       // À adapter exactement au code lampe
+static const bool     ACCEPT_ANY_CODE = false;   // true pour debug (accepte tout)
+// static const uint8_t  RECV_PIN_MODE = INPUT;     // passer à INPUT_PULLUP si besoin
+
+// decode_results results;
 
 // ---------- Rafales / Incrément ----------
-static const uint8_t  BURST_N = 11;               // nb de codes pour 1 incrément
-static const uint32_t BURST_GAP_RESET_MS = 3000;  // reset de la rafale si trou > 200ms
-uint8_t  burstCount    = 0;
-uint32_t lastBurstAt   = 0;                      // dernier décodage pris en compte
+static const int  BURST_N = 11;               // nb de codes pour 1 incrément
+static const uint32_t  BURST_GAP_RESET_MS = 3000;  // reset de la rafale si trou > 200ms
+int  burstCount    = 0;
+uint32_t  lastBurstAt   = 0;                      // dernier décodage pris en compte
 
 // Anti-spam du tick
 static const uint32_t MIN_TICK_SPACING_MS = 500; // min 120ms entre 2 ticks audio
@@ -75,14 +73,14 @@ static const uint8_t TRACK_LOSE = 3;  // loose
 static const uint8_t TRACK_WIN  = 4;  // win
 
 // ---------- Gameplay ----------
-const float REP_MAX          = 4.0f; // seuil de hit
+const float REP_MAX          = 3.0f; // seuil de hit
 const float DECAY_STEP       = 0.3f;  // décroissance
 const uint32_t DECAY_PERIOD_MS = 4000; // période de décroissance
 const uint32_t VOL_BASE      = 3;     // volume offset
 const uint32_t VOL_GAIN      = 10;     // volume slope
 uint32_t now = millis();
-bool vibration;
-bool Lastvibration;
+bool vibration = false;
+bool Lastvibration = false;
 
 // ---------- FreeRTOS ----------
 TaskHandle_t networkTaskHandle;
@@ -108,7 +106,7 @@ volatile uint32_t hitCount = 0;
 uint32_t lastSentCount  = 0;
 uint32_t lastAckedCount = 0;
 unsigned long lastSentAt = 0;
-const unsigned long RESYNC_PERIOD_MS = 2000;
+const unsigned long RESYNC_PERIOD_MS = 3000;
 
 inline void publishHitCount(uint32_t k) {
   String payload = String(esp32_id) + ":HIT_COUNT=" + String(k);
@@ -136,12 +134,15 @@ void setup() {
     while (true) { vTaskDelay(100 / portTICK_PERIOD_MS); }
   }
   Serial.println("DFPlayer Mini OK.");
-  myDFPlayer.volume(0);
+  myDFPlayer.volume(30);
+  
 
   // ---------- TSOP / IRremote ----------
-  pinMode(RECV_PIN, RECV_PIN_MODE);
-  irrecv.enableIRIn();
-  Serial.println("TSOP prêt (logique rafales).");
+  pinMode(RECV_PIN, INPUT);           // PAS de pullup sur un TSOP 4838
+  IrReceiver.begin(RECV_PIN);
+  Serial.println("TSOP prêt (Arduino-IRremote).");
+
+  Serial.println(esp32_id);
 
   // ---------- Wi-Fi events ----------
   WiFi.onEvent(WiFiEvent);
@@ -161,7 +162,7 @@ void gameLogicTask(void* parameter) {
   uint32_t lastDecayTick = millis();
 
   while (true) {
-    Serial.println (burstCount);
+    // Serial.println (burstCount);
      now = millis();
      // --- Logique rafale ---
         if (now - lastBurstAt > BURST_GAP_RESET_MS) {
@@ -175,70 +176,64 @@ void gameLogicTask(void* parameter) {
             Lastvibration = false;
             if (burstCount <= 0) analogWrite(MOTOR_PIN, 0); // PWM 0-255
           }
-    // ----- DÉCODE IR -----
-    if (irrecv.decode(&results)) {
-      bool valid = false;
+ // ----- DÉCODE IR -----
+if (IrReceiver.decode()) {
+  bool valid = false;
+  auto &d = IrReceiver.decodedIRData;
 
-      // Option debug
-      if (ACCEPT_ANY_CODE) {
-        valid = true;
-      } else {
-        // On considère valide si c’est le code attendu
-        if (results.value == KILLER_CODE) 
-        {
-          // burstCount++;
-          valid = true;
-        }
-
-        // Si ta lampe est NEC et envoie des "repeats", on peut compter le repeat aussi :
-        // if (results.repeat) valid = true;  // <- décommente si utile dans tes tests
-      }
-
-      if (valid && !invulnerable) {
-        lastValidIrMs = now;
-        lastBurstAt = now;
-
-        burstCount++;
-        if (burstCount > 0 && !vibration)
-        {
-          analogWrite(MOTOR_PIN, 255); // PWM 0-255
-          vibration = true;
-        }
-        // Quand on atteint BURST_N, on incrémente la jauge
-        if (burstCount >= (BURST_N - difflvl)) {
-          burstCount = 0;
-          Lastvibration = true;
-          // Incrément de repérage (on garde la cadence “difficulte” si tu veux lisser)
-          // Ici on peut reprendre le pas "1", le rythme général étant fixé par la rafale
-          reperage += 1.0f;
-        
-          if (reperage > REP_MAX) reperage = REP_MAX;
-
-          // Volume lié à la jauge (si utile)
-          vol = (int)(reperage * VOL_GAIN) + VOL_BASE;
-          myDFPlayer.volume(vol);
-
-          // Tick son court anti-spam
-          if (now - lastTickSoundAt >= MIN_TICK_SPACING_MS && reperage < REP_MAX) {
-            myDFPlayer.play(TRACK_TICK);
-            // analogWrite(MOTOR_PIN, 255); // PWM 0-255
-            lastTickSoundAt = now;
-          }
-
-          // Debug
-          // Serial.printf("REP=%.1f (tick)\n", reperage);
-        }
-      }
-
-      irrecv.resume(); // prêt pour prochaine trame
+  if (ACCEPT_ANY_CODE) {
+    valid = true;
+  } else {
+    if (d.protocol == NEC && d.address == 0x0000 && d.command == 0xA9) {
+      valid = true;
     }
+    // Compter les repeats NEC si tu veux :
+    // if (d.flags & IRDATA_FLAGS_IS_REPEAT) valid = true;
+  }
+
+  if (valid && !invulnerable) {
+    const uint32_t nowMs = millis();
+    lastValidIrMs = nowMs;
+    lastBurstAt   = nowMs;
+
+    burstCount++;
+    if (!vibration) {
+      analogWrite(MOTOR_PIN, 255);
+      vibration = true;
+    }
+
+    const int burstThreshold = max(1, (int)ceilf((float)BURST_N - difflvl));
+    if (burstCount >= burstThreshold) {
+      burstCount = 0;
+      Lastvibration = true;
+
+      reperage += 1.0f;
+      if (reperage > REP_MAX) reperage = REP_MAX;
+
+      // vol = (int)(reperage * VOL_GAIN) + VOL_BASE;
+
+      if ((nowMs - lastTickSoundAt) >= MIN_TICK_SPACING_MS && reperage < REP_MAX) {
+        // myDFPlayer.volume(vol);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        myDFPlayer.play(TRACK_TICK);
+        vTaskDelay(400 / portTICK_PERIOD_MS);
+        lastTickSoundAt = nowMs;
+      }
+    }
+  }
+
+  IrReceiver.resume();
+}
+
+
 
     // ----- VALIDATION D’UN HIT -----
     if (reperage >= REP_MAX && !invulnerable) {
       Serial.println("HIT validé → piste HIT");
-      myDFPlayer.volume(30);
-      vTaskDelay(80 / portTICK_PERIOD_MS);
+      // myDFPlayer.volume(30);
+      vTaskDelay(100 / portTICK_PERIOD_MS);
       myDFPlayer.play(2);
+      vTaskDelay(500 / portTICK_PERIOD_MS);
 
       Etat = "1";
       invTime = millis();
@@ -272,7 +267,7 @@ void gameLogicTask(void* parameter) {
       sendDetectionMessage("IR_notdetected");
       Etat = "0";
       // digitalWrite(LED, LOW);
-      myDFPlayer.volume(0);
+      // myDFPlayer.volume(0);
     }
 
     //----- RESYNC HIT_COUNT (option réactivée si besoin) -----
@@ -374,7 +369,7 @@ void reconnectMQTT() {
       attemptCount++;
       if (attemptCount >= 5) {
         Serial.println("Trop d'échecs MQTT → reset Wi-Fi...");
-        // resetWiFi();
+        resetWiFi();
         attemptCount = 0;
       }
       vTaskDelay(5000 / portTICK_PERIOD_MS);
@@ -450,7 +445,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     lastAckedCount = 0;
     lastSentAt = millis();
     publishHitCount(0);
-    myDFPlayer.volume(0);
+    myDFPlayer.volume(30);
     reperage = 0;
     invulnerable = false;
     Etat = "0";

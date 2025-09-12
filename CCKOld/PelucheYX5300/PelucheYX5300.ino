@@ -14,7 +14,7 @@ const char* password = "CACHE-CACHEKILLER";
 const char* mqtt_server = "192.168.0.139";
 const char* mqtt_user = "DjiooDanTae";
 const char* mqtt_password = "DjioopPod";
-const char* esp32_id = "Peluche2"; // Identifiant unique pour cet ESP32
+const char* esp32_id = "Peluche10"; // Identifiant unique pour cet ESP32
 
 // MQTT
 WiFiClient espClient;
@@ -406,35 +406,40 @@ void gameLogicTask(void* parameter) {
         digitalWrite(LED2, LOW);
         digitalWrite(LED3, LOW);
         digitalWrite(LED4, LOW);
+        isplaying = false;
+          isplaying2 = false;
+          led = 0;
+      mouvementDetecte = false;
 
-        if (OffMSG)
-        {
-          vTaskDelay(pdMS_TO_TICKS(500));
-    myDFPlayer.stop();
-    vTaskDelay(pdMS_TO_TICKS(500));
-        myDFPlayer.volume(15);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        int valeur [] = {4,5,15};
-        int randomTrack = random(0,3);
-        myDFPlayer.play(valeur[randomTrack]);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        OffMSG = false;
-        }
+    //     if (OffMSG)
+    //     {
+    //       vTaskDelay(pdMS_TO_TICKS(500));
+    // myDFPlayer.stop();
+    // vTaskDelay(pdMS_TO_TICKS(500));
+    //     myDFPlayer.volume(15);
+    //     vTaskDelay(pdMS_TO_TICKS(500));
+    //     int valeur [] = {4,5,15};
+    //     int randomTrack = random(0,3);
+    //     myDFPlayer.play(valeur[randomTrack]);
+    //     vTaskDelay(pdMS_TO_TICKS(500));
+    //     OffMSG = false;
+    //     }
     }
     //Serial.println(PelucheActive);
     if (PelucheActive){
-
-      if (OnMSG)
-      {
-         vTaskDelay(pdMS_TO_TICKS(500));
-    myDFPlayer.stop();
-    vTaskDelay(pdMS_TO_TICKS(500));
-        myDFPlayer.volume(20);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        myDFPlayer.play(7);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        OnMSG = false;
-      }
+      // led = 0;
+      // mouvementDetecte = false;
+      // if (OnMSG)
+    //   {
+    //      vTaskDelay(pdMS_TO_TICKS(500));
+    // myDFPlayer.stop();
+    // vTaskDelay(pdMS_TO_TICKS(500));
+    //     myDFPlayer.volume(20);
+    //     vTaskDelay(pdMS_TO_TICKS(500));
+    //     myDFPlayer.play(7);
+    //     vTaskDelay(pdMS_TO_TICKS(500));
+    //     OnMSG = false;
+      // }
       //Serial.print("Good");
     // long duration;
     // float distance;
@@ -489,8 +494,8 @@ void gameLogicTask(void* parameter) {
           vTaskDelay(pdMS_TO_TICKS(300));
           myDFPlayer.volume(30);
           vTaskDelay(pdMS_TO_TICKS(300));
-          int valeur [] = {2,6,8, 12, 13, 16};
-          int randomTrack = random(0,6);
+          int valeur [] = {2,6,8, 12, 13, 16, 4, 5, 15, 7};
+          int randomTrack = random(0,10);
           myDFPlayer.play(valeur[randomTrack]);
           vTaskDelay(pdMS_TO_TICKS(300));
           isplaying2 = true;
@@ -509,23 +514,23 @@ void gameLogicTask(void* parameter) {
         //     }
         // }
 
-        if (millis() - End >= 15000) {
+        if (millis() - End >= 5000) {
           led = 0;
           noDetection = true;
           sendMQTTMessage("Player notdetected");
-          vTaskDelay(pdMS_TO_TICKS(300));
-          myDFPlayer.volume(30);
-          vTaskDelay(pdMS_TO_TICKS(300));
-          int valeur [] = {9,10,14};
-          int randomTrack = random(0,3);
-          myDFPlayer.play(valeur[randomTrack]);
-          vTaskDelay(pdMS_TO_TICKS(300));
+          // vTaskDelay(pdMS_TO_TICKS(300));
+          // myDFPlayer.volume(30);
+          // vTaskDelay(pdMS_TO_TICKS(300));
+          // int valeur [] = {9,10,14};
+          // int randomTrack = random(0,3);
+          // myDFPlayer.play(valeur[randomTrack]);
+          // vTaskDelay(pdMS_TO_TICKS(300));
           ShortVoice = millis();
           isplaying2 = false;
           LastSpot = millis();
         }
 
-        if (millis() - End < 15000) { 
+        if (millis() - End < 5000) { 
           if (millis() - LedTime > 300) {
             if (digitalRead(LED) == 1) {
               digitalWrite(LED, LOW);
@@ -548,25 +553,26 @@ void gameLogicTask(void* parameter) {
           vTaskDelay(pdMS_TO_TICKS(300));
           myDFPlayer.volume(30);
           vTaskDelay(pdMS_TO_TICKS(300));
-          int valeur [] = {1,3};
-          int randomTrack = random(0,2);
+          int valeur [] = {2,6,8, 12, 13, 16, 4, 5, 15, 7};
+          int randomTrack = random(0,10);
           myDFPlayer.play(valeur[randomTrack]);
           vTaskDelay(pdMS_TO_TICKS(300));
           sendMQTTMessage("Player detected");
           isplaying = true;
           isplaying2 = false;
+          // led = 0;
         }
 
         LastSpot = millis();
 
-        if (millis() - End >= 30000) {
+        if (millis() - End >= 5000) {
           led = 0;
           sendMQTTMessage("Player notdetected");
           isplaying = false;
           LastSpot = millis();
         }
 
-        if (millis() - End < 30000) {
+        if (millis() - End < 5000) {
           if (millis() - LedTime > 100) {
             if (digitalRead(LED) == 1) {
               digitalWrite(LED, LOW);

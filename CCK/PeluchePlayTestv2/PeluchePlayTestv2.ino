@@ -5,8 +5,8 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
-#include <ArduinoOTA.h> // tout en haut
-#include <ESPmDNS.h>
+// #include <ArduinoOTA.h> // tout en haut
+// #include <ESPmDNS.h>
 
 
 // Informations Wi-Fi
@@ -17,7 +17,7 @@ const char* password = "CACHE-CACHEKILLER";
 const char* mqtt_server = "192.168.0.139";
 const char* mqtt_user = "DjiooDanTae";
 const char* mqtt_password = "DjioopPod";
-const char* esp32_id = "Peluche1"; // Identifiant unique pour cet ESP32
+const char* esp32_id = "Peluche2"; // Identifiant unique pour cet ESP32
 
 // MQTT
 WiFiClient espClient;
@@ -75,7 +75,7 @@ int SpottedPlayer[MAX_PLAYERS];
 TaskHandle_t wifiTaskHandle;
 TaskHandle_t gameLogicTaskHandle;
 TaskHandle_t bleScanTaskHandle;
-TaskHandle_t otaTaskHandle; // nouvelle tâche OTA
+// TaskHandle_t otaTaskHandle; // nouvelle tâche OTA
 
 // Prototypes
 void connectToWiFi();
@@ -85,7 +85,7 @@ void sendMQTTMessage(const char* message);
 void wifiTask(void* parameter);
 void gameLogicTask(void* parameter);
 void bleScanTask(void* parameter);
-void otaTask(void* parameter);
+// void otaTask(void* parameter);
 void determineClosestPlayer();
 
 //-------------------------------------------------------------------------------------------------------------------------- Initialisation -------------------------------------------------------------------------------------------------------------------------
@@ -165,7 +165,7 @@ void setup() {
   xTaskCreatePinnedToCore(wifiTask, "WiFiTask", 4096, NULL, 1, &wifiTaskHandle, 0);
   xTaskCreatePinnedToCore(gameLogicTask, "GameLogicTask", 4096, NULL, 1, &gameLogicTaskHandle, 1);
   xTaskCreatePinnedToCore(bleScanTask, "BLEScanTask", 4096, NULL, 1, &bleScanTaskHandle, 0);
-  xTaskCreatePinnedToCore(otaTask, "OTATask", 8192, NULL, 1, &otaTaskHandle, 0);
+  // xTaskCreatePinnedToCore(otaTask, "OTATask", 8192, NULL, 1, &otaTaskHandle, 0);
 }
 
 void loop() {
@@ -199,53 +199,53 @@ void bleScanTask(void* parameter) {
   }
 }
 
-void otaTask(void* parameter) {
-  // Attendre que le WiFi soit bien connecté
-  while (WiFi.status() != WL_CONNECTED) {
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-  }
+// void otaTask(void* parameter) {
+//   // Attendre que le WiFi soit bien connecté
+//   while (WiFi.status() != WL_CONNECTED) {
+//     vTaskDelay(500 / portTICK_PERIOD_MS);
+//   }
 
-  // Configuration du nom OTA
-  ArduinoOTA.setHostname(esp32_id);
+//   // Configuration du nom OTA
+//   ArduinoOTA.setHostname(esp32_id);
 
-  if (!MDNS.begin(esp32_id)) {
-  Serial.println("Erreur lors de l'initialisation de mDNS !");
-  vTaskDelete(NULL); // Arrête la tâche OTA proprement
-}
+//   if (!MDNS.begin(esp32_id)) {
+//   Serial.println("Erreur lors de l'initialisation de mDNS !");
+//   vTaskDelete(NULL); // Arrête la tâche OTA proprement
+// }
 
 
-  // GESTION DES TÂCHES PENDANT L'OTA
-  ArduinoOTA.onStart([]() {
-    vTaskSuspend(bleScanTaskHandle);
-    vTaskSuspend(gameLogicTaskHandle);
-    vTaskSuspend(wifiTaskHandle);  // en plus de ble et gameLogic
-    Serial.println("Tâches suspendues pour OTA");
-  });
+//   // GESTION DES TÂCHES PENDANT L'OTA
+//   ArduinoOTA.onStart([]() {
+//     vTaskSuspend(bleScanTaskHandle);
+//     vTaskSuspend(gameLogicTaskHandle);
+//     vTaskSuspend(wifiTaskHandle);  // en plus de ble et gameLogic
+//     Serial.println("Tâches suspendues pour OTA");
+//   });
 
-  ArduinoOTA.onEnd([]() {
-    vTaskResume(bleScanTaskHandle);
-    vTaskResume(gameLogicTaskHandle);
-    vTaskResume(wifiTaskHandle);   // idem en fin ou erreur    
-    Serial.println("Tâches relancées après OTA");
-  });
+//   ArduinoOTA.onEnd([]() {
+//     vTaskResume(bleScanTaskHandle);
+//     vTaskResume(gameLogicTaskHandle);
+//     vTaskResume(wifiTaskHandle);   // idem en fin ou erreur    
+//     Serial.println("Tâches relancées après OTA");
+//   });
 
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Erreur OTA [%u]\n", error);
-    // Facultatif : relancer quand même les tâches
-    vTaskResume(bleScanTaskHandle);
-    vTaskResume(gameLogicTaskHandle);    
-    vTaskResume(wifiTaskHandle);   // idem en fin ou erreur
-  });
+//   ArduinoOTA.onError([](ota_error_t error) {
+//     Serial.printf("Erreur OTA [%u]\n", error);
+//     // Facultatif : relancer quand même les tâches
+//     vTaskResume(bleScanTaskHandle);
+//     vTaskResume(gameLogicTaskHandle);    
+//     vTaskResume(wifiTaskHandle);   // idem en fin ou erreur
+//   });
 
-  ArduinoOTA.begin(); // ⚠️ Doit venir APRÈS les callbacks
+//   ArduinoOTA.begin(); // ⚠️ Doit venir APRÈS les callbacks
 
-  Serial.println("OTA initialisé. Prêt à recevoir.");
+//   Serial.println("OTA initialisé. Prêt à recevoir.");
 
-  while (true) {
-    ArduinoOTA.handle();
-    vTaskDelay(pdMS_TO_TICKS(5));
-  }
-}
+//   while (true) {
+//     ArduinoOTA.handle();
+//     vTaskDelay(pdMS_TO_TICKS(5));
+//   }
+// }
 
 
 // Gestionnaire d'événements Wi-Fi

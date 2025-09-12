@@ -44,7 +44,7 @@ const int blinkInterval = 300;  // millisecondes
 
 bool isLooped = false;
 bool JustOnce = false;
-const int NbrTour = 5;
+const int NbrTour = 2;
 int SpottedPlayer = 0;
 float diffLvl = 1;
 unsigned long ShockTime;
@@ -345,7 +345,7 @@ void generatorTask(void* parameter) {
         analogWrite(LED_DECORATIVE_PIN3, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
         analogWrite(LED_DECORATIVE_PIN4, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
 
-        updateProgressRing2(turnCount, (NbrTour - 1) + diffLvl);  // 🎯 Affichage LED progressif
+        updateProgressRing2(turnCount, (NbrTour) + diffLvl);  // 🎯 Affichage LED progressif
         // 🔹 Détection du capteur secondaire (doit être activé avant le principal)
         if (digitalRead(MAG_SENSOR_1) == 0 && !capteur2Passe) {  // Anti-rebond
           capteur2Passe = true;
@@ -359,16 +359,16 @@ void generatorTask(void* parameter) {
           capteur2Passe = false;  // Réinitialisation
         }
 
-        if (turnCount >= lastAnnouncedTurn + 1 && turnCount < (NbrTour - 2) + diffLvl) {
+        if (turnCount >= lastAnnouncedTurn + 1 && turnCount < (NbrTour) + diffLvl) {
           lastAnnouncedTurn = turnCount;
           //playTrackOnce(2, 30);
         }
 
-        if (turnCount >= (NbrTour - 1) + diffLvl) {
+        if (turnCount >= (NbrTour) + diffLvl) {
           genState = FINISHED;
           notifyMQTT("generateur reparer");
           stateStartTime = millis();
-          updateProgressRing2(turnCount,(NbrTour - 1) + diffLvl); 
+          updateProgressRing2(turnCount,(NbrTour) + diffLvl); 
           stopLoopTrack();
           Serial.println("✅ Niveau 1 validé, passage en WAITING.");
         }
