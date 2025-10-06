@@ -20,15 +20,17 @@ const char* mqtt_password = "DjioopPod";
 
 // ---------- IDs / IO ----------
 const int MOTOR_PIN = 13; // GPIO13 = D13 sur beaucoup de cartes ESP32
-const char* esp32_id = "Player7"; // Identifiant unique pour cet ESP32
+const char* esp32_id = "Player2"; // Identifiant unique pour cet ESP32
+String BLENAME = "Player:2";
+String Player = String(2);
+String Etat   = "0";           // "0" normal, "1" touché
 
 // ---------- États jeu ----------
 bool  invulnerable   = false;
 float reperage       = 0;       // jauge 0..REP_MAX
 float difflvl        = 1.0f;    // influencé par Unity
 int   vol            = 0;
-String Player = String(2);
-String Etat   = "0";           // "0" normal, "1" touché
+
 
 // ---------- MQTT ----------
 WiFiClient espClient;
@@ -154,6 +156,8 @@ void setup() {
   Serial.println("TSOP prêt (Arduino-IRremote).");
 
   Serial.println(esp32_id);
+
+  ble.begin(BLENAME);
 
   // ---------- Wi-Fi events ----------
   WiFi.onEvent(WiFiEvent);

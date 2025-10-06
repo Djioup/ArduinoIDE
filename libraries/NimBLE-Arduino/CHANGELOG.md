@@ -1,6 +1,32 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [2.3.6] 2025-09-05
+
+## Fixed
+- NimBLEAdvertisedDevice::isConnectable returning incorrect result.
+- Extended advertisements not reporting full data.
+
+## Added
+- Support up to 1650 bytes of advertisement with extended advertising.
+
+## [2.3.5] 2025-09-02
+
+## Fixed
+- esp32c3/s3 max connections not being properly applied.
+
+## [2.3.4] 2025-08-10
+
+## Fixed
+- `NimBLEClientCallbacks::OnConnectFail` not called when connection not established.
+- Removed invalid reference to refactored original examples in README.md.
+- Cleanup redefinition warnings for arduino core 3.3+.
+
+## [2.3.3] 2025-07-27
+
+## Fixed
+- Multiple definition errors for some functions with esp32c6/h2/c2 with Arduino core 3.3+.
+
 ## [2.3.2] 2025-06-27
 
 ## Fixed
