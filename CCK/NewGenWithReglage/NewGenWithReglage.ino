@@ -14,7 +14,7 @@ const char* password = "CACHE-CACHEKILLER";
 const char* mqtt_server = "192.168.0.139";
 const char* mqtt_user = "DjiooDanTae";
 const char* mqtt_password = "DjioopPod";
-const char* esp32_id = "Generator6";
+const char* esp32_id = "Generator5";
 
 // WiFi et MQTT
 WiFiClient espClient;
@@ -33,17 +33,46 @@ const int MAG_SENSOR_1 = 27;
 const int MAG_SENSOR_2 = 14;  // 14
 const int GENERATOR_BUTTON_PIN = 23;
 const int LED_BUTTON_PIN = 22;
-const int LED_DECORATIVE_PIN = 21;  //5
-const int LED_DECORATIVE_PIN2 = 19;
-const int LED_DECORATIVE_PIN3 = 18;
+const int LED_DECORATIVE_PIN = 5;  //5
+// const int LED_DECORATIVE_PIN2 = 19;
+// const int LED_DECORATIVE_PIN3 = 18;
 // const int LED_DECORATIVE_PIN4 = 33;
 // INTERUPT1 // 21
 // INTERUPT2 // 19
 // INTERUPT3 // 18
 // rubanLEd // 4
+
+// // === MINI-JEU "PINCE CROCO" (actif uniquement en COUNTING) ===================
+// #define LED_OK 2                  // LED intégrée comme feedback
+// int MG_PORTS[] = { 25, 32, 33 };  // ports à toucher avec la pince (GND)
+// const int MG_N = sizeof(MG_PORTS) / sizeof(MG_PORTS[0]);
+
+// int mgTargetIdx = -1;  // index du port cible (dans MG_PORTS)
+// bool mgHasTarget = false;
+// --- Pince croco (contacts vers GND, pullup) ---
+const int CROCO_PINS[] = { 26, 32, 33 };
+const int CROCO_N = sizeof(CROCO_PINS) / sizeof(CROCO_PINS[0]);
+
+// --- Interrupteurs (contacts vers GND, pullup) ---
+const int SW_PINS[] = { 18, 19, 21 };
+const int SW_N = sizeof(SW_PINS) / sizeof(SW_PINS[0]);
+const bool SW_ACTIVE_LOW = true;
+
+// --- Potentiomètres (ADC) ---
+#define POT1 34
+#define POT2 35
+
+// #define LED_OK 2
+
+
 #define ANNEAULED 13
 #define NUM_LEDS 24
 Adafruit_NeoPixel ring(NUM_LEDS, ANNEAULED, NEO_GRB + NEO_KHZ800);
+
+#define IND_PIN 4  // <— choisis une pin dispo
+#define IND_NUM 3  // 3 voyants: [0]=croco, [1]=switches, [2]=pots
+Adafruit_NeoPixel indicators(IND_NUM, IND_PIN, NEO_GRB + NEO_KHZ800);
+
 
 unsigned long lastBlinkTime = 0;
 bool blinkState = false;
@@ -61,21 +90,11 @@ static int lastAnnouncedTurn = 0;
 unsigned long lastTurnDetectedTime = 0;  // Timestamp du dernier tour détecté
 unsigned long KillerTime = 0;
 bool ReglageOK = true;
-
-unsigned long previousMillis = 0;
-float tLED = 0;
-// Variables bouton
-unsigned long buttonPressStart = 0;
-bool buttonWasPressed = false;
-const unsigned long LONG_PRESS_TIME = 10000;  // 3 secondes
-
-int playerRSSI;
-
-bool capteur2Passe = false;      // Variable pour savoir si le capteur secondaire a été traversé
-int turnCount = 0;               // Nombre de tours validés
-unsigned long lastTurnTime = 0;  // Anti-rebond global
-bool Shocked = false;
-bool Killerholding = false;
+int TimeDecharge = 30000;
+unsigned long Decharge = 0;
+int RegFalse = 0;
+int NbTrue = 0;
+int playerNameSpotted = -1;
 
 enum GeneratorState {
   COUNTING,
@@ -95,7 +114,21 @@ GeneratorState genState = INITIATE;
 unsigned long stateStartTime = 0;
 unsigned long buttonHoldStartTime = 0;
 
-// Tâche FreeRTOS
+int playerRSSI;
+
+bool capteur2Passe = false;      // Variable pour savoir si le capteur secondaire a été traversé
+int turnCount = 0;               // Nombre de tours validés
+unsigned long lastTurnTime = 0;  // Anti-rebond global
+bool Shocked = false;
+bool Killerholding = false;
+
+unsigned long previousMillis = 0;
+float tLED = 0;
+// Variables bouton
+unsigned long buttonPressStart = 0;
+bool buttonWasPressed = false;
+const unsigned long LONG_PRESS_TIME = 10000;  // 3 secondes
+
 TaskHandle_t bleScanTaskHandle;
 TaskHandle_t mqttTaskHandle;
 TaskHandle_t gameTaskHandle;
@@ -164,7 +197,11 @@ bool anyThreat(int rssiThreshold /*ex: -100*/) {
   for (int i = 0; i < 8; i++) {
     if (players[i].key.length() == 0) continue;
     bool fresh = (now - players[i].lastSeen) <= STALE_MS;
-    if (fresh && players[i].spotted == 1 && players[i].rssi > rssiThreshold) return true;
+    if (fresh && players[i].spotted == 1 && players[i].rssi > rssiThreshold)
+    {
+      playerNameSpotted = i;
+      return true;
+    } 
   }
   return false;
 }
@@ -207,7 +244,7 @@ volatile int dfp_next = -1;
 volatile bool dfp_next_loop = false;
 volatile uint32_t dfp_started_ms = 0;
 
-const uint32_t DFP_GAP_MS = 200;          // délai entre 2 trames
+const uint32_t DFP_GAP_MS = 300;          // délai entre 2 trames
 const uint32_t DFP_WATCHDOG_MS = 180000;  // 3 min secours si pas d’événement
 
 static void dfpStartNow(int track, bool loop) {
@@ -220,80 +257,317 @@ static void dfpStartNow(int track, bool loop) {
   vTaskDelay(pdMS_TO_TICKS(DFP_GAP_MS));
 }
 
+// ====== États/cibles par mini-jeu (évalués en continu) ======
+enum MiniGameId { MG_CROC,
+                  MG_SWITCHES,
+                  MG_POTS };
 
+// CROCO
+int crocoTargetIdx = -1;  // index 0..2
+bool crocoOK = false;
+unsigned long crocoLowSince = 0;
 
+// SWITCHES (cible 3 bits 0..7, stabilité 3 s)
+byte swTarget = 0;
+bool swOK = false;
+bool swInMatch = false;
+unsigned long swMatchSince = 0;
 
-// === MINI-JEU "PINCE CROCO" (actif uniquement en COUNTING) ===================
-#define LED_OK 2                  // LED intégrée comme feedback
-int MG_PORTS[] = { 25, 32, 33 };  // ports à toucher avec la pince (GND)
-const int MG_N = sizeof(MG_PORTS) / sizeof(MG_PORTS[0]);
+// POTS (cible somme, fenêtre & stabilité 3 s)
+int potTarget = 0;
+bool potsOK = false;
+bool potInRange = false;
+unsigned long potGoodSince = 0;
 
-int mgTargetIdx = -1;  // index du port cible (dans MG_PORTS)
-bool mgHasTarget = false;
+// Fenêtres/temporisations (ajuste si besoin)
+// const unsigned long CROCO_HOLD_MS = 50;
+// const unsigned long MATCH_HOLD_MS = 3000;
+// const int POT_TIGHT = 80;  // “parfait”
+// const int POT_NEAR = 500;  // “on s'approche”
 
-void mgPickNewTarget() {
-  if (MG_N <= 0) return;
-  int newIdx;
-  do { newIdx = random(0, MG_N); } while (MG_N > 1 && newIdx == mgTargetIdx);
-  mgTargetIdx = newIdx;
-  mgHasTarget = true;
-  Serial.printf("[MG] Nouvelle cible: GPIO %d\n", MG_PORTS[mgTargetIdx]);
-  JustOnce2 = false;
+// ---- À mettre avec tes autres constantes (haut du fichier) ----
+const unsigned long CROCO_HOLD_MS = 50;    // LOW maintenu
+const unsigned long SW_DEBOUNCE_MS = 20;   // stabilité par switch
+const unsigned long MATCH_HOLD_MS = 3000;  // maintien combinaison OK
+const int POT_TIGHT = 500;                 // fenêtre "parfait"
+const int POT_NEAR = 1000;                 // feedback proche (non validant)
+const int POT_HYST = 40;                   // hystérésis autour de POT_TIGHT
+const int POT_OVERSAMPLE = 4;              // x lectures pour réduire le bruit
+const float POT_EMA_ALPHA = 0.25f;         // lissage EMA (0..1)
+
+// ---- Statics de filtrage (à mettre en global, près des états mini-jeux) ----
+// CROCO
+static int croco_lastPin = -1;
+static bool croco_latchedLow = false;
+
+// SWITCHES (un petit filtre par broche)
+static bool sw_lastRaw[3] = { false, false, false };
+static bool sw_stable[3] = { false, false, false };
+static unsigned long sw_since[3] = { 0, 0, 0 };
+
+// POTS (EMA sur la somme)
+static float pot_emaSum = 0.0f;
+
+// Front descendant de ReglageOK (true -> false) sans variable globale explicite
+static inline bool onFall_ReglageOK(bool cur) {
+  static bool init = false;
+  static bool old;
+  if (!init) {
+    old = cur;
+    init = true;
+    return false;
+  }                           // synchro initiale
+  bool fire = (!cur && old);  // true -> false
+  old = cur;
+  JustOnce = false;
+  return fire;
 }
 
-void mgUpdateLED() {
-  if (!mgHasTarget) {
-    digitalWrite(LED_OK, LOW);
-    // NE PAS forcer ReglageOK ici
-    return;
+static inline bool onRise_ReglageOK(bool cur) {
+  static bool init = false;
+  static bool old;
+  if (!init) {
+    old = cur;
+    init = true;
+    return false;
+  }                           // synchro initiale
+  bool fire = (cur && !old);  // false -> true
+  old = cur;
+  JustOnce = false;
+  return fire;
+}
+
+
+static inline bool readSwitchPin(int pin) {
+  int v = digitalRead(pin);
+  return SW_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
+}
+
+void initAllTargets() {
+  // Croco: choisir une borne
+  crocoTargetIdx = random(0, CROCO_N);
+  crocoOK = false;
+  crocoLowSince = 0;
+  Serial.printf("[Init] Croco cible GPIO %d\n", CROCO_PINS[crocoTargetIdx]);
+
+  // Switches: 3 bits
+  swTarget = (byte)random(0, 8);
+  swOK = false;
+  swInMatch = false;
+  swMatchSince = 0;
+  Serial.printf("[Init] Switches cible = %d%d%d\n",
+                (swTarget >> 2) & 1, (swTarget >> 1) & 1, swTarget & 1);
+
+  // Pots: somme
+  potTarget = random(600, 7000);
+  potsOK = false;
+  potInRange = false;
+  potGoodSince = 0;
+  Serial.printf("[Init] Pots cible somme = %d\n", potTarget);
+}
+
+// Change la cible d’UN seul jeu (au hasard, ou impose id=MG_CROC/MG_SWITCHES/MG_POTS)
+void pickNewTarget(int id = -1) {
+  if (id < 0 || id > 2) id = random(0, 3);
+  switch ((MiniGameId)id) {
+    case MG_CROC:
+      {
+        int old = crocoTargetIdx;
+        int idx;
+        do { idx = random(0, CROCO_N); } while (CROCO_N > 1 && idx == old);
+        crocoTargetIdx = idx;
+        crocoOK = false;
+        crocoLowSince = 0;
+        Serial.printf("[Target] Croco -> GPIO %d\n", CROCO_PINS[crocoTargetIdx]);
+      }
+      break;
+
+    case MG_SWITCHES:
+      {
+        byte old = swTarget;
+        byte tgt;
+        do { tgt = (byte)random(0, 8); } while (tgt == old);
+        swTarget = tgt;
+        swOK = false;
+        swInMatch = false;
+        swMatchSince = 0;
+        Serial.printf("[Target] Switches -> %d%d%d\n",
+                      (swTarget >> 2) & 1, (swTarget >> 1) & 1, swTarget & 1);
+      }
+      break;
+
+    case MG_POTS:
+      {
+        int old = potTarget;
+        int tgt;
+        do { tgt = random(600, 7000); } while (tgt == old);
+        potTarget = tgt;
+        potsOK = false;
+        potInRange = false;
+        potGoodSince = 0;
+        Serial.printf("[Target] Pots -> somme %d\n", potTarget);
+      }
+      break;
   }
+}
+void updateAllMiniGames() {
+  unsigned long now = millis();
 
-  const int pin = MG_PORTS[mgTargetIdx];
+  // ----- CROCO -----
+  // ---------------- CROCO ----------------
+  {
+    const int pin = CROCO_PINS[crocoTargetIdx];
+    // (1) Réaffirme PULLUP chaque passe
+    pinMode(pin, INPUT_PULLUP);
 
-  // (1) Réaffirme l’état du GPIO à chaque passage (blindage pull-up)
-  pinMode(pin, INPUT_PULLUP);
-
-  // (2) Anti-glitch temporel: LOW doit tenir ≥ 50 ms pour être "OK"
-  static int lastPin = -1;
-  static bool latchedLow = false;
-  static unsigned long lowSince = 0;
-
-  if (pin != lastPin) {
-    // reset si on change de cible
-    latchedLow = false;
-    lowSince = 0;
-    lastPin = pin;
-  }
-
-  bool sampleLow = (digitalRead(pin) == LOW);
-
-  // (2b) Option: triple sample ultracourt pour lisser les spikes (total ~1 ms)
-  if (sampleLow) {
-    for (int i = 0; i < 3; ++i) {
-      delayMicroseconds(300);
-      if (digitalRead(pin) != LOW) {
-        sampleLow = false;
-        break;
+    // (2) Triple sample ultracourt pour lisser
+    bool sampleLow = (digitalRead(pin) == LOW);
+    if (sampleLow) {
+      for (int i = 0; i < 3; ++i) {
+        delayMicroseconds(300);
+        if (digitalRead(pin) != LOW) {
+          sampleLow = false;
+          break;
+        }
       }
     }
-  }
 
-  unsigned long now = millis();
-  if (sampleLow) {
-    if (!latchedLow) {
-      latchedLow = true;
-      lowSince = now;
+    // (3) Latch + temporisation (exactement ton mgUpdateLED)
+    if (pin != croco_lastPin) {
+      croco_latchedLow = false;
+      crocoLowSince = 0;
+      croco_lastPin = pin;
     }
-  } else {
-    latchedLow = false;
-    lowSince = 0;
+
+    if (sampleLow) {
+      if (!croco_latchedLow) {
+        croco_latchedLow = true;
+        crocoLowSince = now;
+      }
+    } else {
+      croco_latchedLow = false;
+      crocoLowSince = 0;
+    }
+
+    crocoOK = (croco_latchedLow && (now - crocoLowSince >= CROCO_HOLD_MS));
   }
 
-  bool okStable = (latchedLow && (now - lowSince >= 50));  // seuil 50 ms (ajuste 30–100 ms si besoin)
+  // ----- SWITCHES -----
+  {
+    bool s0 = readSwitchPin(SW_PINS[0]);
+    bool s1 = readSwitchPin(SW_PINS[1]);
+    bool s2 = readSwitchPin(SW_PINS[2]);
+    byte cur = (s2 << 2) | (s1 << 1) | (s0 << 0);
 
-  ReglageOK = okStable;
-  digitalWrite(LED_OK, ReglageOK ? HIGH : LOW);
+    if (cur == swTarget) {
+      if (!swInMatch) {
+        swInMatch = true;
+        swMatchSince = now;
+      }
+      if (now - swMatchSince >= 50) swOK = true;
+    } else {
+      swInMatch = false;
+      swOK = false;
+    }
+  }
+
+  // ----- POTS -----
+  {
+    int v1 = analogRead(POT1);
+    int v2 = analogRead(POT2);
+    int sum = v1 + v2;
+    int diff = abs(sum - potTarget);
+
+    if (diff < POT_TIGHT) {
+      if (!potInRange) {
+        potInRange = true;
+        potGoodSince = now;
+      }
+      if (now - potGoodSince >= 50) {
+        potsOK = true;
+        indicators.setPixelColor(2, 0, 255, 0);
+      }
+    } else if (diff < POT_NEAR) {
+      potInRange = false;  // proche mais pas encore validable
+      potsOK = false;
+      indicators.setPixelColor(2, 255, 60, 0);
+    } else {
+      potInRange = false;
+      potsOK = false;
+      indicators.setPixelColor(2, 255, 0, 0);
+    }
+  }
+
+  // ----- Agrégation -----
+  bool ok = (crocoOK && swOK && potsOK);
+  ReglageOK = ok;                         // vérité unique
+  // digitalWrite(LED_OK, ok ? HIGH : LOW);  // feedback matériel simple
 }
+
+
+// void mgPickNewTarget() {
+//   if (MG_N <= 0) return;
+//   int newIdx;
+//   do { newIdx = random(0, MG_N); } while (MG_N > 1 && newIdx == mgTargetIdx);
+//   mgTargetIdx = newIdx;
+//   mgHasTarget = true;
+//   Serial.printf("[MG] Nouvelle cible: GPIO %d\n", MG_PORTS[mgTargetIdx]);
+//   JustOnce2 = false;
+// }
+
+// void mgUpdateLED() {
+//   if (!mgHasTarget) {
+//     digitalWrite(LED_OK, LOW);
+//     // NE PAS forcer ReglageOK ici
+//     return;
+//   }
+
+//   const int pin = MG_PORTS[mgTargetIdx];
+
+//   // (1) Réaffirme l’état du GPIO à chaque passage (blindage pull-up)
+//   pinMode(pin, INPUT_PULLUP);
+
+//   // (2) Anti-glitch temporel: LOW doit tenir ≥ 50 ms pour être "OK"
+//   static int lastPin = -1;
+//   static bool latchedLow = false;
+//   static unsigned long lowSince = 0;
+
+//   if (pin != lastPin) {
+//     // reset si on change de cible
+//     latchedLow = false;
+//     lowSince = 0;
+//     lastPin = pin;
+//   }
+
+//   bool sampleLow = (digitalRead(pin) == LOW);
+
+//   // (2b) Option: triple sample ultracourt pour lisser les spikes (total ~1 ms)
+//   if (sampleLow) {
+//     for (int i = 0; i < 3; ++i) {
+//       delayMicroseconds(300);
+//       if (digitalRead(pin) != LOW) {
+//         sampleLow = false;
+//         break;
+//       }
+//     }
+//   }
+
+//   unsigned long now = millis();
+//   if (sampleLow) {
+//     if (!latchedLow) {
+//       latchedLow = true;
+//       lowSince = now;
+//     }
+//   } else {
+//     latchedLow = false;
+//     lowSince = 0;
+//   }
+
+//   bool okStable = (latchedLow && (now - lowSince >= 50));  // seuil 50 ms (ajuste 30–100 ms si besoin)
+
+//   ReglageOK = okStable;
+//   digitalWrite(LED_OK, ReglageOK ? HIGH : LOW);
+// }
 
 
 // Hystérésis d'affichage pour ReglageOK (évite les flips 1–2 frames lors des tours)
@@ -325,6 +599,21 @@ inline float clamp01(float x) {
   if (x > 1) return 1;
   return x;
 }
+
+inline uint32_t IC_RED() {
+  return indicators.gamma32(indicators.Color(255, 0, 0));
+}
+inline uint32_t IC_GREEN() {
+  return indicators.gamma32(indicators.Color(0, 255, 0));
+}
+
+void drawMiniGameIndicators() {
+  indicators.setPixelColor(0, crocoOK ? IC_GREEN() : IC_RED());
+  indicators.setPixelColor(1, swOK ? IC_GREEN() : IC_RED());
+  // indicators.setPixelColor(2, potsOK ? IC_GREEN() : IC_RED());
+  indicators.show();
+}
+
 
 
 //===================================================SETUP INITIALISATION========================================================
@@ -421,11 +710,11 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
 
 // --- SETUP ---
 void setup() {
-  delay(1000);
+  delay(2000);
   Serial.begin(115200);
-  delay(1000);
+  delay(2000);
   Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
-  delay(1000);
+  delay(2000);
 
   Serial.println("Initialisation du DFPlayer Mini...");
   if (!myDFPlayer.begin(Serial2)) {
@@ -454,18 +743,29 @@ void setup() {
   pinMode(GENERATOR_BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_BUTTON_PIN, OUTPUT);
   pinMode(LED_DECORATIVE_PIN, OUTPUT);
-  pinMode(LED_DECORATIVE_PIN2, OUTPUT);
-  pinMode(LED_DECORATIVE_PIN3, OUTPUT);
+  // 2  pinMode(LED_DECORATIVE_PIN2, OUTPUT);
+  // pinMode(LED_DECORATIVE_PIN3, OUTPUT);
   // pinMode(LED_DECORATIVE_PIN4, OUTPUT);
   digitalWrite(LED_BUTTON_PIN, HIGH);
   analogWrite(LED_DECORATIVE_PIN, 0);
-  analogWrite(LED_DECORATIVE_PIN2, 0);
-  analogWrite(LED_DECORATIVE_PIN3, 0);
+  // analogWrite(LED_DECORATIVE_PIN2, 0);
+  // analogWrite(LED_DECORATIVE_PIN3, 0);
   // analogWrite(LED_DECORATIVE_PIN4, 0);
 
-  pinMode(LED_OK, OUTPUT);
-  digitalWrite(LED_OK, LOW);
-  for (int i = 0; i < MG_N; ++i) pinMode(MG_PORTS[i], INPUT_PULLUP);
+  // --- MINI-JEUX I/O ---
+  // pinMode(LED_OK, OUTPUT);
+  // digitalWrite(LED_OK, LOW);
+  for (int i = 0; i < CROCO_N; ++i) pinMode(CROCO_PINS[i], INPUT_PULLUP);
+  for (int i = 0; i < SW_N; ++i) pinMode(SW_PINS[i], INPUT_PULLUP);
+  pinMode(POT1, INPUT);
+  pinMode(POT2, INPUT);
+
+  // cibles initiales (une par jeu)
+  initAllTargets();  // (code ci-dessous)
+
+  indicators.begin();
+  indicators.show();
+
 
   ring.begin();
   ring.show();  // Initialisation (tout éteint)
@@ -511,34 +811,34 @@ void setup() {
 //========================================GAME LOGIC=====================================================
 
 // --- FONCTIONS AUDIO ---
-void playTrackOnce(int track, int volume) {
-  Serial.printf("Lecture de la piste %d avec volume %d\n", track, volume);
-  // vTaskDelay(300 / portTICK_PERIOD_MS);
-  // myDFPlayer.volume(volume);
-  // vTaskDelay(300 / portTICK_PERIOD_MS);
-  myDFPlayer.play(track);
-  vTaskDelay(200 / portTICK_PERIOD_MS);
-}
+// void playTrackOnce(int track, int volume) {
+//   Serial.printf("Lecture de la piste %d avec volume %d\n", track, volume);
+//   // vTaskDelay(300 / portTICK_PERIOD_MS);
+//   // myDFPlayer.volume(volume);
+//   // vTaskDelay(300 / portTICK_PERIOD_MS);
+//   myDFPlayer.play(track);
+//   vTaskDelay(200 / portTICK_PERIOD_MS);
+// }
 
-void playLoopedTrack(int track, int volume) {
-  if (!isLooped) {
-    Serial.printf("Lecture en boucle de la piste %d avec volume %d\n", track, volume);
-    // vTaskDelay(300 / portTICK_PERIOD_MS);
-    // myDFPlayer.volume(volume);
-    // vTaskDelay(300 / portTICK_PERIOD_MS);
-    myDFPlayer.loop(track);
-    vTaskDelay(200 / portTICK_PERIOD_MS);
-    isLooped = true;
-  }
-}
+// void playLoopedTrack(int track, int volume) {
+//   if (!isLooped) {
+//     Serial.printf("Lecture en boucle de la piste %d avec volume %d\n", track, volume);
+//     // vTaskDelay(300 / portTICK_PERIOD_MS);
+//     // myDFPlayer.volume(volume);
+//     // vTaskDelay(300 / portTICK_PERIOD_MS);
+//     myDFPlayer.loop(track);
+//     vTaskDelay(200 / portTICK_PERIOD_MS);
+//     isLooped = true;
+//   }
+// }
 
-void stopLoopTrack() {
-  Serial.println("Arrêt de la boucle.");
-  // vTaskDelay(300 / portTICK_PERIOD_MS);
-  myDFPlayer.stop();
-  vTaskDelay(200 / portTICK_PERIOD_MS);
-  isLooped = false;
-}
+// void stopLoopTrack() {
+//   Serial.println("Arrêt de la boucle.");
+//   // vTaskDelay(300 / portTICK_PERIOD_MS);
+//   myDFPlayer.stop();
+//   vTaskDelay(200 / portTICK_PERIOD_MS);
+//   isLooped = false;
+// }
 
 // void audioTask(void*) {
 //   // Init matérielle déjà faite dans setup() -> myDFPlayer.begin(Serial2), volume()
@@ -668,6 +968,7 @@ void generatorTask(void* parameter) {
       ShockTime = millis();
       Serial.println("⚡ Choc déclenché ! Joueur trop proche !");
       Shocked = true;
+      // notifyMQTT ("Player" + playerNameSpotted + ":SABOTAGE");
       // stopLoopTrack();
       audioStop();
       audioLoop(8);
@@ -684,51 +985,66 @@ void generatorTask(void* parameter) {
       // stopLoopTrack();
     }
 
-    if (digitalRead(GENERATOR_BUTTON_PIN) == LOW && !Killerholding) {
-      // stopLoopTrack();
-      audioStop();
-      previousGenState = genState;
-      genState = KILLERHOLDING;
-      Shocked = true;
-      Killerholding = true;
-      KillerTime = millis();
-      KillerTurn = 0;
-      Serial.println("KillerHolding Activated");
-      // playLoopedTrack(7, 30);
-      audioLoop(7);
-    }
+    // if (digitalRead(GENERATOR_BUTTON_PIN) == LOW && !Killerholding) {
+    //   // stopLoopTrack();
+    //   audioStop();
+    //   previousGenState = genState;
+    //   genState = KILLERHOLDING;
+    //   Shocked = true;
+    //   Killerholding = true;
+    //   KillerTime = millis();
+    //   KillerTurn = 0;
+    //   Serial.println("KillerHolding Activated");
+    //   // playLoopedTrack(7, 30);
+    //   audioLoop(7);
+    // }
 
     //Serial.println(digitalRead(27));
     switch (genState) {
       case COUNTING:
-        if (turnCount == 0 && !mgHasTarget) {
-          mgPickNewTarget();  // choisit une broche
-          JustOnce = false;   // déverrouille les cues audio liés au réglage
+
+        // if (turnCount == 0 && !mgHasTarget) {
+        //   pickNewTarget();  // choisit une broche
+        //   JustOnce = false;   // déverrouille les cues audio liés au réglage
+        // }
+        NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (potsOK ? 1 : 0);
+        RegFalse = 3 - NbTrue;
+        drawMiniGameIndicators();
+        updateAllMiniGames();
+        if (onFall_ReglageOK(ReglageOK)) {
+          audioStop();
+          audioPlay(11);
+          audioLoop(14);
         }
-         mgUpdateLED();
-        if (turnCount == 0 && !JustOnce) {
+        if (turnCount == 0 && ReglageOK && !JustOnce) {
           audioLoop(1);
           JustOnce = true;
         }
-        if (!ReglageOK && !JustOnce) {
-          audioStop();
-          audioPlay(11);
-          // audioLoop(); piste réparation nécessaire
-          JustOnce = true;
-        }
-        if (!JustOnce && ReglageOK && turnCount > 0) {
+        // if (!ReglageOK && !JustOnce) {
+        //   audioStop();
+        //   audioPlay(11);
+        //   // audioLoop(); piste réparation nécessaire
+        //   JustOnce = true;
+        // }
+        if (onRise_ReglageOK(ReglageOK) && turnCount > 0) {
           audioStop();
           audioLoop(10);
-          JustOnce = true;
+          // JustOnce = true;
         }
+
+        if (!ReglageOK && millis() - Decharge > TimeDecharge) {
+          Decharge = millis();
+          if (turnCount > 0) turnCount -= 1;
+        }
+
         colorSecondRed();
-        digitalWrite(LED_BUTTON_PIN, HIGH);
+        digitalWrite(LED_BUTTON_PIN, LOW);
         analogWrite(LED_DECORATIVE_PIN, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
-        analogWrite(LED_DECORATIVE_PIN2, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
-        analogWrite(LED_DECORATIVE_PIN3, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
+        // analogWrite(LED_DECORATIVE_PIN2, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
+        // analogWrite(LED_DECORATIVE_PIN3, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
         // analogWrite(LED_DECORATIVE_PIN4, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
 
-        updateProgressRing(turnCount, NbrTour + diffLvl);  // 🎯 Affichage LED progressif
+        updateProgressRing(turnCount, NbrTour + diffLvl, 0);  // 🎯 Affichage LED progressif
 
         // 🔹 Détection du capteur secondaire (doit être activé avant le principal)
         if (digitalRead(MAG_SENSOR_1) == 0 && !capteur2Passe) {  // Anti-rebond
@@ -737,13 +1053,23 @@ void generatorTask(void* parameter) {
         }
 
         if (capteur2Passe && digitalRead(MAG_SENSOR_2) == 0) {  // Vérifie si capteur 2 a été activé avant
-          if (ReglageOK) turnCount++;
+          if (ReglageOK) {
+            turnCount++;
+            audioStop();
+            audioPlay(2);  // piste tour
+            audioLoop(10);
+          }
           if (!ReglageOK) {
-            int randomTurn = random(0, 4);
-            if (randomTurn > 0) {
+            int randomTurn = random(0, 5);
+            if (randomTurn > RegFalse) {
               turnCount++;
+              audioStop();
+              audioPlay(2);
+              audioLoop(14);
             } else {
-              // piste audio boom
+              audioStop();
+              audioPlay(13);
+              audioLoop(14);
             }
           }
           Serial.printf("✅ Tour complet détecté ! Total : %d\n", turnCount);
@@ -754,23 +1080,16 @@ void generatorTask(void* parameter) {
           lastAnnouncedTurn = turnCount;
           if (turnCount < 2) {
             // audioStop();
-            mgPickNewTarget();
+            pickNewTarget();
+            updateAllMiniGames();
             JustOnce = false;
-            mgUpdateLED();
           }
           // stopLoopTrack();
           int randomPick = random(0, 4);
-          if (randomPick <= 0) {
-            mgPickNewTarget();
-            mgUpdateLED();
+          if (randomPick <= RegFalse) {
+            pickNewTarget();
+            updateAllMiniGames();
             JustOnce = false;
-          }
-          // playLoopedTrack(10, (10 + (turnCount * 3)));
-          if (ReglageOK) {
-            audioStop();
-            audioPlay(2);  // piste tour
-            audioLoop(10);
-            JustOnce = true;
           }
         }
 
@@ -782,14 +1101,14 @@ void generatorTask(void* parameter) {
           stateStartTime = millis();
           // stopLoopTrack();
           // audioPlay();  piste phase 1 réussi
-          updateProgressRing(turnCount, NbrTour + diffLvl);  // 🎯 Affichage LED progressif
+          updateProgressRing(turnCount, NbrTour + diffLvl, 0);  // 🎯 Affichage LED progressif
           Serial.println("✅ Niveau 1 validé, passage en WAITING.");
         }
         break;
 
       case WAITING:
         {
-          colorFirstHalfGreen();
+          colorFirstHalfGreen(0);
           Killerholding = true;
           Shocked = true;
           // playLoopedTrack(9, 30);
@@ -801,8 +1120,8 @@ void generatorTask(void* parameter) {
 
           digitalWrite(LED_BUTTON_PIN, LOW);
           analogWrite(LED_DECORATIVE_PIN, 255);
-          analogWrite(LED_DECORATIVE_PIN2, 255);
-          analogWrite(LED_DECORATIVE_PIN3, 255);
+          // analogWrite(LED_DECORATIVE_PIN2, 255);
+          // analogWrite(LED_DECORATIVE_PIN3, 255);
           // analogWrite(LED_DECORATIVE_PIN4, 255);
 
           unsigned long durationMs = (unsigned long)(20000 * diffLvl);  // même durée que votre timer
@@ -818,7 +1137,7 @@ void generatorTask(void* parameter) {
             genState = COUNTING2;
             // stopLoopTrack();
             ReglageOK = true;
-            mgHasTarget = false;
+            // mgHasTarget = false;
             audioStop();
             JustOnce = false;
             lastTurnDetectedTime = millis();  // Mise à jour de l'heure du dernier tour détecté
@@ -845,7 +1164,7 @@ void generatorTask(void* parameter) {
             // stopLoopTrack();
             audioStop();
           }
-          digitalWrite(LED_BUTTON_PIN, HIGH);
+          digitalWrite(LED_BUTTON_PIN, LOW);
         } else {
           buttonHoldStartTime = 0;
           digitalWrite(LED_BUTTON_PIN, (millis() / 500) % 2);
@@ -853,95 +1172,121 @@ void generatorTask(void* parameter) {
           audioLoop(4);
         }
         analogWrite(LED_DECORATIVE_PIN, random(0, 255));
-        analogWrite(LED_DECORATIVE_PIN2, random(0, 255));
-        analogWrite(LED_DECORATIVE_PIN3, random(0, 255));
+        // analogWrite(LED_DECORATIVE_PIN2, random(0, 255));
+        // analogWrite(LED_DECORATIVE_PIN3, random(0, 255));
         // analogWrite(LED_DECORATIVE_PIN4, random(0, 255));
         break;
 
       case COUNTING2:
-        colorFirstHalfGreen();
-        mgUpdateLED();
-        // playLoopedTrack(4, 30);
-        if (!JustOnce && ReglageOK) {
-          audioStop();
-          // audioLoop(4); phase 2 iddle
-          JustOnce = true;
-        }
-
-        if (!JustOnce && !ReglageOK) {
-          audioStop();
-          audioPlay(11);
-          // audioLoop(); piste besoin de réparation
-          JustOnce = true;
-        }
-        digitalWrite(LED_BUTTON_PIN, HIGH);
-        analogWrite(LED_DECORATIVE_PIN, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
-        analogWrite(LED_DECORATIVE_PIN2, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
-        analogWrite(LED_DECORATIVE_PIN3, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
-        // analogWrite(LED_DECORATIVE_PIN4, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
-
-        updateProgressRing2(turnCount, (NbrTour) + diffLvl);  // 🎯 Affichage LED progressif
-        // 🔹 Détection du capteur secondaire (doit être activé avant le principal)
-        if (digitalRead(MAG_SENSOR_1) == 0 && !capteur2Passe) {  // Anti-rebond
-          capteur2Passe = true;
-          Serial.println("🔸 Capteur secondaire activé !");
-        }
-
-        if (capteur2Passe && digitalRead(MAG_SENSOR_2) == 0) {  // Vérifie si capteur 2 a été activé avant
-          if (ReglageOK) turnCount++;
-          if (!ReglageOK) {
-            int randomTurn = random(0, 4);
-            if (randomTurn > 0) {
-              turnCount++;
-            } else {
-              // piste audio boom
-            }
-          }
-          Serial.printf("✅ Tour complet détecté ! Total : %d\n", turnCount);
-          capteur2Passe = false;  // Réinitialisation
-        }
-
-        if (turnCount >= lastAnnouncedTurn + 1 && turnCount < (NbrTour) + diffLvl) {
-          lastAnnouncedTurn = turnCount;
-          //playTrackOnce(2, 30);
-          if (turnCount < 2) {
-            // audioStop();
-            mgPickNewTarget();
-            mgUpdateLED();
-          }
-          // stopLoopTrack();
-          int randomPick = random(0, 4);
-          if (randomPick <= 0) {
-            mgPickNewTarget();
-            mgUpdateLED();
-            JustOnce = false;
-          }
-          // playLoopedTrack(10, (10 + (turnCount * 3)));
-          if (ReglageOK) {
+        {
+          colorFirstHalfGreen(0);
+          NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (potsOK ? 1 : 0);
+          RegFalse = 3 - NbTrue;
+          // if (turnCount == 0 && !mgHasTarget) {
+          //   pickNewTarget();  // choisit une broche
+          //   JustOnce = false;   // déverrouille les cues audio liés au réglage
+          // }
+          drawMiniGameIndicators();
+          updateAllMiniGames();
+          if (onFall_ReglageOK(ReglageOK)) {
             audioStop();
-            // audioPlay(); // piste tour
+            audioPlay(11);
+            audioLoop(14);
+          }
+          if (ReglageOK && !JustOnce) {
             audioLoop(10);
             JustOnce = true;
           }
-        }
+          // if (!ReglageOK && !JustOnce) {
+          //   audioStop();
+          //   audioPlay(11);
+          //   // audioLoop(); piste réparation nécessaire
+          //   JustOnce = true;
+          // }
+          if (onRise_ReglageOK(ReglageOK) && turnCount > 0) {
+            audioStop();
+            audioLoop(10);
+            // JustOnce = true;
+          }
 
-        if (turnCount >= (NbrTour) + diffLvl) {
-          genState = WAITP3;
-          notifyMQTT("generateur reparer");
-          stateStartTime = millis();
-          updateProgressRing2(turnCount, (NbrTour) + diffLvl);
-          // stopLoopTrack();
-          audioStop();
-          JustOnce = false;
-          Serial.println("✅ Niveau 1 validé, passage en WAITING.");
-        }
 
-        // if (millis() - lastTurnDetectedTime >= 300000 - (diffLvl * 20000)) {  // 300000 ms = 5 minutes
-        //   Serial.println("⚠️ Aucune activité détectée pendant 5 minutes. Retour en BUTTON_PHASE.");
-        //   genState = BUTTON_PHASE;
-        //   notifyMQTT("generateur lvl 3");  // Mise à jour MQTT
-        // }
-        break;
+          if (!ReglageOK && millis() - Decharge > TimeDecharge) {
+            Decharge = millis();
+            if (turnCount > 0) turnCount -= 1;
+          }
+
+          digitalWrite(LED_BUTTON_PIN, LOW);
+          analogWrite(LED_DECORATIVE_PIN, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
+          // analogWrite(LED_DECORATIVE_PIN2, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
+          // analogWrite(LED_DECORATIVE_PIN3, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
+          // analogWrite(LED_DECORATIVE_PIN4, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
+
+          updateProgressRing(turnCount, (NbrTour) + diffLvl, 1);   // 🎯 Affichage LED progressif
+                                                                   // 🔹 Détection du capteur secondaire (doit être activé avant le principal)
+          if (digitalRead(MAG_SENSOR_1) == 0 && !capteur2Passe) {  // Anti-rebond
+            capteur2Passe = true;
+            Serial.println("🔸 Capteur secondaire activé !");
+          }
+
+          if (capteur2Passe && digitalRead(MAG_SENSOR_2) == 0) {  // Vérifie si capteur 2 a été activé avant
+            if (ReglageOK) {
+              turnCount++;
+              audioStop();
+              audioPlay(2);  // piste tour
+              audioLoop(10);
+            }
+            if (!ReglageOK) {
+              int randomTurn = random(0, 5);
+              if (randomTurn > RegFalse) {
+                turnCount++;
+                audioStop();
+                audioPlay(2);
+                audioLoop(14);
+              } else {
+                audioStop();
+                audioPlay(13);
+                audioLoop(14);
+              }
+            }
+            Serial.printf("✅ Tour complet détecté ! Total : %d\n", turnCount);
+            capteur2Passe = false;  // Réinitialisation
+          }
+
+          if (turnCount >= lastAnnouncedTurn + 1 && turnCount < NbrTour + diffLvl) {
+            lastAnnouncedTurn = turnCount;
+            if (turnCount < 2) {
+              // audioStop();
+              pickNewTarget();
+              updateAllMiniGames();
+              JustOnce = false;
+            }
+            // stopLoopTrack();
+            int randomPick = random(0, 4);
+            if (randomPick <= RegFalse) {
+              pickNewTarget();
+              updateAllMiniGames();
+              JustOnce = false;
+            }
+          }
+
+          if (turnCount >= (NbrTour) + diffLvl) {
+            genState = WAITP3;
+            notifyMQTT("generateur reparer");
+            stateStartTime = millis();
+            updateProgressRing(turnCount, (NbrTour) + diffLvl, 1);
+            // stopLoopTrack();
+            audioStop();
+            JustOnce = false;
+            Serial.println("✅ Niveau 1 validé, passage en WAITING.");
+          }
+
+          // if (millis() - lastTurnDetectedTime >= 300000 - (diffLvl * 20000)) {  // 300000 ms = 5 minutes
+          //   Serial.println("⚠️ Aucune activité détectée pendant 5 minutes. Retour en BUTTON_PHASE.");
+          //   genState = BUTTON_PHASE;
+          //   notifyMQTT("generateur lvl 3");  // Mise à jour MQTT
+          // }
+          break;
+        }
 
       case WAITP3:
         {
@@ -952,10 +1297,11 @@ void generatorTask(void* parameter) {
             audioLoop(9);
             JustOnce = true;
           }
+          colorFirstHalfGreen(1);
           digitalWrite(LED_BUTTON_PIN, LOW);
           analogWrite(LED_DECORATIVE_PIN, 255);
-          analogWrite(LED_DECORATIVE_PIN2, 255);
-          analogWrite(LED_DECORATIVE_PIN3, 255);
+          // analogWrite(LED_DECORATIVE_PIN2, 255);
+          // analogWrite(LED_DECORATIVE_PIN3, 255);
           // analogWrite(LED_DECORATIVE_PIN4, 255);
 
           unsigned long durationMs = (unsigned long)(30000 * diffLvl);  // même durée que votre timer
@@ -1001,7 +1347,7 @@ void generatorTask(void* parameter) {
           if (buttonPressed) {
             if (millis() - buttonPressStart >= LONG_PRESS_TIME) {
               audioStop();
-              // JustOnce = false;
+              JustOnce = false;
               genState = FINISHED;
             }
           }
@@ -1015,12 +1361,12 @@ void generatorTask(void* parameter) {
 
           if (!buttonPressed) {
             if (!JustOnce) {
-              audioLoop(9);
+              audioLoop(4);
               JustOnce = true;
             }
             analogWrite(LED_DECORATIVE_PIN, 255);
-            analogWrite(LED_DECORATIVE_PIN2, 255);
-            analogWrite(LED_DECORATIVE_PIN3, 255);
+            // analogWrite(LED_DECORATIVE_PIN2, 255);
+            // analogWrite(LED_DECORATIVE_PIN3, 255);
             // analogWrite(LED_DECORATIVE_PIN4, 255);
 
             unsigned long currentMillis = millis();
@@ -1048,11 +1394,12 @@ void generatorTask(void* parameter) {
         Shocked = true;
         digitalWrite(LED_BUTTON_PIN, HIGH);
         analogWrite(LED_DECORATIVE_PIN, 255);
-        analogWrite(LED_DECORATIVE_PIN2, 255);
-        analogWrite(LED_DECORATIVE_PIN3, 255);
+        // analogWrite(LED_DECORATIVE_PIN2, 255);
+        // analogWrite(LED_DECORATIVE_PIN3, 255);
         // analogWrite(LED_DECORATIVE_PIN4, 255);
         // playLoopedTrack(5, 30);
         if (!JustOnce) {
+          audioStop();
           audioLoop(5);
           JustOnce = true;
         }
@@ -1064,8 +1411,8 @@ void generatorTask(void* parameter) {
         animateShockRing();
         digitalWrite((LED_BUTTON_PIN), random(0, 2));
         analogWrite(LED_DECORATIVE_PIN, random(0, 255));
-        analogWrite(LED_DECORATIVE_PIN2, random(0, 255));
-        analogWrite(LED_DECORATIVE_PIN3, random(0, 255));
+        // analogWrite(LED_DECORATIVE_PIN2, random(0, 255));
+        // analogWrite(LED_DECORATIVE_PIN3, random(0, 255));
         // analogWrite(LED_DECORATIVE_PIN4, random(0, 255));
         break;
 
@@ -1075,8 +1422,8 @@ void generatorTask(void* parameter) {
         audioStop();
         digitalWrite((LED_BUTTON_PIN), 0);
         analogWrite(LED_DECORATIVE_PIN, 0);
-        analogWrite(LED_DECORATIVE_PIN2, 0);
-        analogWrite(LED_DECORATIVE_PIN3, 0);
+        // analogWrite(LED_DECORATIVE_PIN2, 0);
+        // analogWrite(LED_DECORATIVE_PIN3, 0);
         // analogWrite(LED_DECORATIVE_PIN4, 0);
         break;
 
@@ -1102,18 +1449,19 @@ void generatorTask(void* parameter) {
           Shocked = false;
           // stopLoopTrack();
           audioStop();
-          updateProgressRing2(0, (NbrTour) + diffLvl);
-          updateProgressRing(0, (NbrTour) + diffLvl);
+          updateProgressRing(0, (NbrTour) + diffLvl, 0);
+          updateProgressRing(0, (NbrTour) + diffLvl, 1);
         }
 
         break;
 
       case INITIATE:
         colorAllRed();
+        pickNewTarget();
         digitalWrite((LED_BUTTON_PIN), 0);
         analogWrite(LED_DECORATIVE_PIN, 0);
-        analogWrite(LED_DECORATIVE_PIN2, 0);
-        analogWrite(LED_DECORATIVE_PIN3, 0);
+        // analogWrite(LED_DECORATIVE_PIN2, 0);
+        // analogWrite(LED_DECORATIVE_PIN3, 0);
         // analogWrite(LED_DECORATIVE_PIN4, 0);
         Shocked = false;
         Killerholding = false;
@@ -1127,7 +1475,7 @@ void generatorTask(void* parameter) {
         audioStop();
         vTaskDelay(300 / portTICK_PERIOD_MS);
         // playLoopedTrack(1, 30);
-        // audioLoop(1);
+        audioLoop(1);
         // vTaskDelay(2000 / portTICK_PERIOD_MS);
         notifyMQTT("generateur lvl 1");
         genState = COUNTING;
@@ -1162,7 +1510,7 @@ void generatorTask(void* parameter) {
 // }
 
 // --- COUNTING: wrapper drop-in (garde TON appel existant) ---
-void updateProgressRing(int turnCount, int totalTours) {
+void updateProgressRing(int turnCount, int totalTours, int Anneau) {
   unsigned long now = millis();
   bool target = ReglageOK;
 
@@ -1179,14 +1527,14 @@ void updateProgressRing(int turnCount, int totalTours) {
     reglage_last_flip = now;
   }
 
-  if (ReglageOK_vis) updateProgressRing_OK(turnCount, totalTours);
-  else updateProgressRing_Fault(turnCount, totalTours);
+  if (ReglageOK_vis) updateProgressRing_OK(turnCount, totalTours, Anneau);
+  else updateProgressRing_Fault(turnCount, totalTours, Anneau);
 }
 
 
 // --- Animation "OK" : fond rouge, progression verte, liseré jaune, comète ambre ---
-void updateProgressRing_OK(int turnCount, int totalTours) {
-  const int start = 0, span = 12, end = start + span;
+void updateProgressRing_OK(int turnCount, int totalTours, int Anneau) {
+  const int start = 12 * Anneau, span = 12, end = start + span;
   const unsigned long now = millis();
   totalTours = max(totalTours, 1);
 
@@ -1233,8 +1581,8 @@ void updateProgressRing_OK(int turnCount, int totalTours) {
 
 // --- Animation "FAULT" : signal réparation, progression toujours visible ---
 // Chevrons ambre sur la zone restante, vert atténué côté rempli, balise blanche
-void updateProgressRing_Fault(int turnCount, int totalTours) {
-  const int start = 0, span = 12, end = start + span;
+void updateProgressRing_Fault(int turnCount, int totalTours, int Anneau) {
+  const int start = 12 * Anneau, span = 12, end = start + span;
   const unsigned long now = millis();
   totalTours = max(totalTours, 1);
 
@@ -1484,8 +1832,8 @@ void animateWaitingSimple(unsigned long startMs, unsigned long durationMs) {
 }
 
 
-void colorFirstHalfGreen() {
-  for (int i = 0; i < 12; i++) {
+void colorFirstHalfGreen(int value) {
+  for (int i = 12 * value; i < 12; i++) {
     ring.setPixelColor(i, ring.Color(0, 255, 0));  // vert
   }
   ring.show();

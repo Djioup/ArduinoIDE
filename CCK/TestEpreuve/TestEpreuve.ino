@@ -1,80 +1,50 @@
-#define POT1 13        // premier potentiomètre (entrée analogique)
-#define POT2 14        // deuxième potentiomètre (entrée analogique)
-#define LED_BUILTIN 2  // LED feedback
+#define POT1 34
+#define POT2 35
+#define LED_BUILTIN 2
 
-// Variables pour les cibles
-int target1 = -1;
-int target2 = -1;
-
-// Variables de contrôle
-unsigned long TimeIn = 0;
-bool inRangeBoth = false;
-unsigned long lastBlink = 0;
-bool ledState = false;
+int target = 0;
+unsigned long goodSince = 0;
+bool inRange = false;
 
 void setup() {
   Serial.begin(9600);
   pinMode(LED_BUILTIN, OUTPUT);
-
-  randomSeed(analogRead(0));  // meilleure génération pseudo-aléatoire
-  newTargets();
+  randomSeed(analogRead(0));
+  newTarget();
 }
 
 void loop() {
   int val1 = analogRead(POT1);
   int val2 = analogRead(POT2);
+  int sum = val1 + val2;
+  int diff = abs(sum - target);
 
-  bool pot1Ok = abs(val1 - target1) <= 100;
-  bool pot2Ok = abs(val2 - target2) <= 100;
-
-  // --- Cas 1 : les deux sont bons -> LED fixe ON ---
-  if (pot1Ok && pot2Ok) {
+  // ----- LED feedback -----
+  if (diff < 80) { // parfait
     digitalWrite(LED_BUILTIN, HIGH);
-
-    if (!inRangeBoth) {
-      TimeIn = millis();
-      inRangeBoth = true;
-    }
-
-    if (millis() - TimeIn > 3000) {
-      newTargets();
-      inRangeBoth = false;
-    }
-  }
-  // --- Cas 2 : seulement un est bon -> LED clignote ---
-  else if (pot1Ok || pot2Ok) {
-    if (millis() - lastBlink > 300) {  // vitesse de clignotement
-      ledState = !ledState;
-      digitalWrite(LED_BUILTIN, ledState);
-      lastBlink = millis();
-    }
-    inRangeBoth = false;
-  }
-  // --- Cas 3 : aucun n’est bon -> LED OFF ---
-  else {
+    if (!inRange) { goodSince = millis(); inRange = true; }
+    if (millis() - goodSince > 3000) newTarget();  // nouvelle cible après 3s
+  } 
+  else if (diff < 500) { // on s'approche -> clignote
+    digitalWrite(LED_BUILTIN, (millis() / 200) % 2);
+    inRange = false;
+  } 
+  else { // trop loin
     digitalWrite(LED_BUILTIN, LOW);
-    inRangeBoth = false;
+    inRange = false;
   }
 
-  // Debug
-  Serial.print("POT1: ");
-  Serial.print(val1);
-  Serial.print(" (Target1: ");
-  Serial.print(target1);
-  Serial.print(") | POT2: ");
-  Serial.print(val2);
-  Serial.print(" (Target2: ");
-  Serial.print(target2);
-  Serial.println(")");
-  delay(50);
+  Serial.print("P1: "); Serial.print(val1);
+  Serial.print(" | P2: "); Serial.print(val2);
+  Serial.print(" | SUM: "); Serial.print(sum);
+  Serial.print(" | TARGET: "); Serial.println(target);
+
+  delay(100);
 }
 
-void newTargets() {
-  target1 = random(0, 4096);
-  target2 = random(0, 4096);
-  Serial.print("New targets -> POT1: ");
-  Serial.print(target1);
-  Serial.print(" | POT2: ");
-  Serial.println(target2);
+void newTarget() {
+  target = random(200, 8000); // évite extrêmes 0 et 8190
+  Serial.print("Nouvelle cible = "); Serial.println(target);
   digitalWrite(LED_BUILTIN, LOW);
+  inRange = false;
 }

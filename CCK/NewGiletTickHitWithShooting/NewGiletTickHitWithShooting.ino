@@ -7,6 +7,7 @@
 #include "ESP32BleAdvertise.h"
 #include <string>
 #include <DFRobotDFPlayerMini.h>
+#include <Adafruit_NeoPixel.h>
 
 // ===== IR (TSOP + Arduino-IRremote) =====
 #include <IRremote.hpp>
@@ -18,12 +19,17 @@ const char* mqtt_server = "192.168.0.139";
 const char* mqtt_user = "DjiooDanTae";
 const char* mqtt_password = "DjioopPod";
 
+
+#define RUBLED 14
+#define NUM_LEDS 3
+Adafruit_NeoPixel RubLed(NUM_LEDS, RUBLED, NEO_GRB + NEO_KHZ800);
+
 // ---------- IDs / IO ----------
 const int MOTOR_PIN = 13;          // GPIO13 = D13 sur beaucoup de cartes ESP32
 const char* esp32_id = "Player2";  // Identifiant unique pour cet ESP32
 String BLENAME = "Player:2";
 String Player = String(2);
-String Etat = "1";  // "0" normal, "1" touché
+String Etat = "0";  // "0" normal, "1" touché
 
 // ---------- États jeu ----------
 bool invulnerable = false;
@@ -32,9 +38,12 @@ float difflvl = 1.0f;  // influencé par Unity
 int vol = 0;
 unsigned long startEtat = 0;
 int endEtat = 0;
+unsigned long starting = 0;
 
 int Heal = 0;
 unsigned long lastTickTime = 0;
+unsigned long startHealingBorne = 0;
+bool HealingBorne = false;
 
 #define LED1 26
 #define LED2 27
@@ -45,7 +54,7 @@ PubSubClient client(espClient);
 
 // ---------- TSOP / IRremote ----------
 
-static const uint8_t RECV_PIN = 15;  // TSOP sur GPIO15
+static const uint8_t RECV_PIN = 4;  // TSOP sur GPIO15
 // static const uint32_t KILLER_CODE = 0xA90;       // À adapter exactement au code lampe
 static const bool ACCEPT_ANY_CODE = false;  // true pour debug (accepte tout)
 // static const uint8_t  RECV_PIN_MODE = INPUT;     // passer à INPUT_PULLUP si besoin
@@ -97,11 +106,14 @@ bool firstIR = false;
 bool findSent = false;
 unsigned long firstIRTime = 0;
 int TickLife = 0;
+bool irIddle = false;
+bool irShoot = false;
 
 // ---------- FreeRTOS ----------
 TaskHandle_t networkTaskHandle;
 TaskHandle_t gameLogicTaskHandle;
 TaskHandle_t bleAdvertisingTaskHandle;
+TaskHandle_t audioTaskHandle;
 
 // ---------- BLE ----------
 SimpleBLE ble;
@@ -157,6 +169,182 @@ static inline bool irBeamPresent() {
 //   return -1;
 // }
 
+// ----- AUDIO COMMANDS -----
+enum AudioCmdType { AUD_PLAY,
+                    AUD_LOOP,
+                    AUD_STOP,
+                    AUD_VOL };
+struct AudioCmd {
+  AudioCmdType type;
+  uint16_t track;  // pour PLAY/LOOP
+  uint8_t volume;  // pour VOL (0..30)
+};
+
+QueueHandle_t audioQ = nullptr;
+
+inline void audioPlay(uint16_t track) {
+  AudioCmd c{ AUD_PLAY, track, 0 };
+  xQueueSend(audioQ, &c, 0);
+}
+inline void audioLoop(uint16_t track) {
+  AudioCmd c{ AUD_LOOP, track, 0 };
+  xQueueSend(audioQ, &c, 0);
+}
+inline void audioStop() {
+  AudioCmd c{ AUD_STOP, 0, 0 };
+  xQueueSend(audioQ, &c, 0);
+}
+inline void audioSetVol(uint8_t v) {
+  AudioCmd c{ AUD_VOL, 0, v };
+  xQueueSend(audioQ, &c, 0);
+}
+
+// --- Lecteur minimal : 1 en cours + 1 en attente ---
+volatile bool dfp_playing = false;
+volatile bool dfp_looping = false;
+volatile int dfp_current = -1;
+volatile int dfp_next = -1;
+volatile bool dfp_next_loop = false;
+volatile uint32_t dfp_started_ms = 0;
+
+const uint32_t DFP_GAP_MS = 300;          // délai entre 2 trames
+const uint32_t DFP_WATCHDOG_MS = 180000;  // 3 min secours si pas d’événement
+
+static void dfpStartNow(int track, bool loop) {
+  if (loop) myDFPlayer.loop(track);
+  else myDFPlayer.play(track);
+  dfp_playing = true;
+  dfp_looping = loop;
+  dfp_current = track;
+  dfp_started_ms = millis();
+  vTaskDelay(pdMS_TO_TICKS(DFP_GAP_MS));
+}
+
+// --- Healing "breathing" ---
+const uint16_t HEAL_PERIOD_MS = 1600;  // durée d'un cycle complet
+const uint8_t  HEAL_MIN_LVL   = 6;     // intensité mini du bleu pendant healing
+const uint8_t  HEAL_MAX_LVL   = 35;    // intensité maxi du bleu pendant healing
+
+// calcule un niveau 0..255 selon une courbe cos lissée
+inline uint8_t healBreathLevel() {
+  uint32_t base = HealingBorne ? (millis() - startHealingBorne) : millis();
+  float x = (base % HEAL_PERIOD_MS) / (float)HEAL_PERIOD_MS;     // 0..1
+  float curve = (1.0f - cosf(2.0f * 3.14159f * x)) * 0.5f;       // 0..1 lissé
+  float lvl = HEAL_MIN_LVL + curve * (HEAL_MAX_LVL - HEAL_MIN_LVL);
+  return (uint8_t)lvl;
+}
+
+
+// --- LED render (non-bloquant) ---
+const uint16_t INVUL_PERIOD_MS = 1000;  // période totale du clignotement
+const uint16_t INVUL_FLASH_MS = 90;    // durée du flash blanc
+const uint8_t BLUE_LEVEL = 20;         // intensité du bleu TickLife
+const uint8_t WHITE_LEVEL = 20;        // intensité du flash blanc
+
+// Affichage "de base" = TickLife en bleu
+void renderLifeBase() {
+  RubLed.clear();
+  int n = constrain(TickLife, 0, NUM_LEDS);
+  for (int i = 0; i < n; i++) {
+    RubLed.setPixelColor(i, RubLed.Color(0, 0, BLUE_LEVEL));
+  }
+  RubLed.show();
+}
+
+// Overlay invulnérable : bref flash blanc puis retour au bleu TickLife
+void renderLEDs() {
+  // 1) Invulnérable : flash blanc court, puis on retombe sur le rendu "fond" (healing ou base)
+  if (invulnerable) {
+    uint32_t phase = (millis() - invTime) % INVUL_PERIOD_MS;
+    if (phase < INVUL_FLASH_MS) {
+      for (int i = 0; i < NUM_LEDS; i++) {
+        RubLed.setPixelColor(i, RubLed.Color(WHITE_LEVEL, WHITE_LEVEL, WHITE_LEVEL));
+      }
+      RubLed.show();
+      return; // le flash est prioritaire
+    }
+    // sinon on laisse continuer pour afficher le fond après le flash
+  }
+
+  // 2) HealingBorne : respiration du bleu, en gardant le nombre de LEDs = TickLife
+  if (HealingBorne) {
+    RubLed.clear();
+    int n = constrain(TickLife, 0, NUM_LEDS);
+    uint8_t lvl = healBreathLevel();      // 6..35 par défaut
+    for (int i = 0; i < n; i++) {
+      RubLed.setPixelColor(i, RubLed.Color(0, 0, lvl));
+    }
+    RubLed.show();
+    return;
+  }
+
+  // 3) Fond "normal" = TickLife en bleu fixe
+  renderLifeBase();
+}
+
+
+
+void VibrationManager() {
+  unsigned long currentMillis = millis();
+  // unsigned long nowVib = 0;
+
+  if (currentMillis - starting > 3000 && !irIddle && !irShoot) {
+    digitalWrite(LED1, LOW);
+    digitalWrite(LED2, LOW);
+  }
+
+  if (currentMillis - starting < 3000) {
+    analogWrite(MOTOR_PIN, 255);
+    digitalWrite(LED1, HIGH);
+    digitalWrite(LED2, HIGH);
+  }
+
+  else if (invulnerable) {
+    const unsigned long cycle = (currentMillis - invTime) % 2000;
+    // 0–100ms ON, 100–200 OFF, 200–300 ON, 300–1200 OFF
+    if ((cycle < 300) || (cycle >= 600 && cycle < 900)) analogWrite(MOTOR_PIN, 200);
+    else analogWrite(MOTOR_PIN, 0);
+  }
+
+  else if (irIddle) {
+    analogWrite(MOTOR_PIN, 200);
+    // digitalWrite(26, HIGH);
+  }
+
+  else if (HealingBorne) {
+    // cycle de respiration total (ms)
+    const unsigned long period = 1600;
+    const int minPower = 30;
+    const int maxPower = 150;
+
+    unsigned long now = millis();
+    float x = (now % period) / (float)period;                 // 0..1 dans le cycle
+    float curve = (1.0f - cosf(2.0f * 3.14159f * x)) * 0.5f;  // courbe lisse montée/descente
+    int pwm = (int)(minPower + curve * (maxPower - minPower));
+
+    analogWrite(MOTOR_PIN, pwm);
+  }
+
+
+  else if (TickLife >= 3) {
+    // Mode double vibration rythmée
+    unsigned long cycle = currentMillis % 3000;  // Durée totale d’un cycle (1.2 seconde)
+
+    // Pattern : vibration - 100ms, pause - 100ms, vibration - 100ms, pause - 900ms
+    if ((cycle < 1000)) {
+      analogWrite(MOTOR_PIN, 150);
+    } else {
+      analogWrite(MOTOR_PIN, 0);
+    }
+  }
+
+  else {
+    analogWrite(MOTOR_PIN, 0);
+
+    // digitalWrite(26, LOW);
+  }
+}
+
 // ===================================================================================
 
 void setup() {
@@ -177,6 +365,10 @@ void setup() {
   Serial.println("DFPlayer Mini OK.");
   myDFPlayer.volume(30);
 
+  RubLed.begin();
+  RubLed.setBrightness(20);
+  RubLed.show();
+
 
   // ---------- TSOP / IRremote ----------
   pinMode(RECV_PIN, INPUT);  // PAS de pullup sur un TSOP 4838
@@ -187,16 +379,86 @@ void setup() {
 
   ble.begin(BLENAME);
 
+  audioQ = xQueueCreate(16, sizeof(AudioCmd));
+
   // ---------- Wi-Fi events ----------
   WiFi.onEvent(WiFiEvent);
 
   // ---------- Tâches ----------
   xTaskCreatePinnedToCore(networkTask, "NetworkTask", 8192, NULL, 2, &networkTaskHandle, 0);
-  xTaskCreatePinnedToCore(gameLogicTask, "GameLogicTask", 8192, NULL, 3, &gameLogicTaskHandle, 1);
+  xTaskCreatePinnedToCore(gameLogicTask, "GameLogicTask", 8192, NULL, 4, &gameLogicTaskHandle, 1);
   xTaskCreatePinnedToCore(bleAdvertisingTask, "BLEAdvertisingTask", 4096, NULL, 1, &bleAdvertisingTaskHandle, 0);
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 4096, NULL, 3, &audioTaskHandle, 1);
 }
 
 void loop() { /* tout est en tasks */
+}
+
+void audioTask(void*) {
+  const TickType_t idleDelay = pdMS_TO_TICKS(5);
+  AudioCmd cmd;
+
+  for (;;) {
+    // 1) Récupère toutes les commandes envoyées par audioPlay/Loop/Stop/Vol
+    while (xQueueReceive(audioQ, &cmd, 0) == pdTRUE) {
+      switch (cmd.type) {
+        case AUD_PLAY:
+          if (!dfp_playing) dfpStartNow(cmd.track, false);
+          else {
+            dfp_next = (int)cmd.track;
+            dfp_next_loop = false;
+          }
+          break;
+
+        case AUD_LOOP:
+          if (!dfp_playing) dfpStartNow(cmd.track, true);
+          else {
+            dfp_next = (int)cmd.track;
+            dfp_next_loop = true;
+          }
+          break;
+
+        case AUD_STOP:
+          myDFPlayer.stop();
+          dfp_playing = false;
+          dfp_looping = false;
+          dfp_current = -1;
+          dfp_next = -1;  // on efface aussi l’attente
+          vTaskDelay(pdMS_TO_TICKS(DFP_GAP_MS));
+          break;
+
+        case AUD_VOL:
+          myDFPlayer.volume(constrain(cmd.volume, 0, 30));
+          vTaskDelay(pdMS_TO_TICKS(DFP_GAP_MS));
+          break;
+      }
+    }
+
+    // 2) Fin de piste par événement série (safe)
+    if (myDFPlayer.available()) {
+      uint8_t t = myDFPlayer.readType();
+      (void)myDFPlayer.read();  // consomme la valeur associée si présente
+      if (t == DFPlayerPlayFinished) {
+        dfp_playing = false;  // la piste non-loop vient de finir
+      }
+      // (option) gérer DFPlayerError ici
+    }
+
+    // 3) Watchdog de secours si l’événement n’arrive pas (clones capricieux)
+    if (dfp_playing && !dfp_looping) {
+      if (millis() - dfp_started_ms > DFP_WATCHDOG_MS) {
+        dfp_playing = false;  // on considère la piste terminée
+      }
+    }
+
+    // 4) Si libre et une piste est en attente, on la lance
+    if (!dfp_playing && dfp_next != -1) {
+      dfpStartNow(dfp_next, dfp_next_loop);
+      dfp_next = -1;
+    }
+
+    vTaskDelay(idleDelay);
+  }
 }
 
 // ===================================================================================
@@ -206,7 +468,14 @@ void gameLogicTask(void* parameter) {
   uint32_t lastDecayTick = millis();
 
   while (true) {
-    // Serial.println (burstCount);
+
+    VibrationManager();
+    // life();
+    renderLEDs();
+    HealBorne();
+    // audioLoop(5);
+    // digitalWrite(26, HIGH);
+    // Serial.println(TickLife);
     // now = millis();
     // // --- Logique rafale ---
     // if (now - lastBurstAt > BURST_GAP_RESET_MS) {
@@ -223,8 +492,8 @@ void gameLogicTask(void* parameter) {
 
     // ----- DÉCODE IR -----
     if (IrReceiver.decode()) {
-      bool irIddle = false;
-      bool irShoot = false;
+      irIddle = false;
+      irShoot = false;
       auto& d = IrReceiver.decodedIRData;
       IrReceiver.printIRResultShort(&Serial);  // résumé propre (protocole, adresse, commande)
 
@@ -275,10 +544,10 @@ void gameLogicTask(void* parameter) {
           sendToLanterne("FIND");
           findSent = true;
         }
-        if (!vibration) {
-          analogWrite(MOTOR_PIN, 200);
-          vibration = true;
-        }
+        // if (!vibration) {
+        //   starting = millis();
+        //   vibration = true;
+        // }
       }
 
       if (irShoot && !invulnerable) {
@@ -291,13 +560,12 @@ void gameLogicTask(void* parameter) {
           lastSentTickCount = tickCount;
           lastTickSentAt = millis();
           publishTickCount(lastSentTickCount);
-          analogWrite(MOTOR_PIN, 255);
-          EtatBLE(1, 30000);
+          // analogWrite(MOTOR_PIN, 255);
+          starting = millis();
+          EtatBLE(1, 20000);
           // invTime = millis();
-          invulnerableF(15000);
-          vTaskDelay(100 / portTICK_PERIOD_MS);
-          myDFPlayer.play(TRACK_TICK);
-          vTaskDelay(400 / portTICK_PERIOD_MS);
+          invulnerableF(10000);
+          audioPlay(TRACK_TICK);
         }
 
         if (TickLife >= 3) {
@@ -316,10 +584,11 @@ void gameLogicTask(void* parameter) {
           lastSentHitCount = hitCount;
           lastHitSentAt = millis();
           publishHitCount(lastSentHitCount);
-          analogWrite(MOTOR_PIN, 255);
-          vTaskDelay(100 / portTICK_PERIOD_MS);
-          myDFPlayer.play(2);
-          vTaskDelay(500 / portTICK_PERIOD_MS);
+          // analogWrite(MOTOR_PIN, 255);
+
+          starting = millis();
+
+          audioPlay(2);
         }
       }
 
@@ -392,6 +661,8 @@ void gameLogicTask(void* parameter) {
     if (!irBeamPresent() && invulnerable) {
       digitalWrite(LED1, LOW);
       digitalWrite(LED2, LOW);
+      irIddle = false;
+      irShoot = false;
     }
     if (!irBeamPresent() && !invulnerable) {
       // uint32_t now = millis();
@@ -399,13 +670,15 @@ void gameLogicTask(void* parameter) {
       // reperage -= DECAY_STEP;
       // if (reperage < 0) reperage = 0;
       // lastDecayTick = now;
-      if (analogRead(MOTOR_PIN) != 0) analogWrite(MOTOR_PIN, 0);  // PWM 0-255
+      // if (analogRead(MOTOR_PIN) != 0) analogWrite(MOTOR_PIN, 0);  // PWM 0-255
       if (findSent) {
         sendToLanterne("LOST");
         findSent = false;
       }
       firstIR = false;
       vibration = false;
+      irIddle = false;
+      irShoot = false;
       digitalWrite(LED1, LOW);
       digitalWrite(LED2, LOW);
       // sendToLanterne("LOST");
@@ -426,13 +699,18 @@ void gameLogicTask(void* parameter) {
       // invulnerable = false;
       // reperage = 0;
       // sendDetectionMessage("IR_notdetected");
-      Etat = "1";
+      if (TickLife == 0) {
+        Etat = "0";
+      } else if (TickLife != 0) {
+        Etat = "3";
+      }
       // digitalWrite(LED, LOW);
       // myDFPlayer.volume(0);
     }
 
-    if (millis() - lastTickTime > Heal && TickLife != 0) {
+    if (millis() - lastTickTime > Heal && TickLife != 0 && !invulnerable && !HealingBorne) {
       HealTime();
+      lastTickTime = millis();
     }
 
     //----- RESYNC HIT_COUNT (option réactivée si besoin) -----
@@ -479,7 +757,30 @@ void EtatBLE(int e, int etatTimer) {
 
 void HealTime() {
   TickLife -= 1;
+  if (TickLife < 0) TickLife = 0;
   lastTickTime = millis();
+}
+
+void HealBorne() {
+  int HealingBorneTick = 30000;
+  if (HealingBorne && !invulnerable) {
+    if (millis() - startHealingBorne > HealingBorneTick) {
+      TickLife = 0;
+    }
+  }
+}
+
+void life() {
+  RubLed.clear();
+  for (int i = 0; i < TickLife; i++) {
+    RubLed.setPixelColor(i, RubLed.Color(0, 0, 30));
+  }
+  RubLed.show();
+  // for (int y = TickLife; y < 3; y++)
+  // {
+  //   RubLed.setPixelColor(y, RubLed.Color(0,0,0));
+  //   RubLed.show();
+  // }
 }
 
 
@@ -613,18 +914,14 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
   if (message.endsWith("WIN")) {
     Serial.println("WIN");
-    vTaskDelay(80 / portTICK_PERIOD_MS);
-    myDFPlayer.volume(30);
-    vTaskDelay(120 / portTICK_PERIOD_MS);
-    myDFPlayer.play(TRACK_WIN);
+    audioStop();
+    audioPlay(TRACK_WIN);
   }
 
   if (message.endsWith("LOOSE")) {
     Serial.println("LOOSE");
-    vTaskDelay(80 / portTICK_PERIOD_MS);
-    myDFPlayer.volume(30);
-    vTaskDelay(120 / portTICK_PERIOD_MS);
-    myDFPlayer.play(TRACK_LOSE);
+    audioStop();
+    audioPlay(TRACK_LOSE);
   }
 
   // ✅ ACK HIT_COUNT : "Player0:ACK_COUNT=N"
@@ -657,6 +954,20 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
   }
 
+  if (message.startsWith(String(esp32_id) + ":SABOTAGE")) {
+    // audioPlay(); piste sabotage gen
+  }
+
+  if (message.startsWith(String(esp32_id) + ":Healing")) {
+    HealingBorne = true;
+    startHealingBorne = millis();
+  }
+
+  if (message.startsWith(String(esp32_id) + ":StopHealing")) {
+    HealingBorne = false;
+  }
+
+
   if (message.endsWith("RESET")) {
     Serial.println("[RESET] remise à zéro");
 
@@ -674,10 +985,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
     lastTickSentAt = millis();
     publishTickCount(0);
 
-    myDFPlayer.volume(30);
     reperage = 0;
     invulnerable = false;
     Etat = "0";
+    TickLife = 0;
     // burstCount = 0;
   }
 }

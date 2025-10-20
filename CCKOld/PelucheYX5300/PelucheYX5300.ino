@@ -2,9 +2,10 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <DFRobotDFPlayerMini.h>
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
+// #include <BLEDevice.h>
+// #include <BLEUtils.h>
+// #include <BLEScan.h>
+#include <NimBLEDevice.h>
 
 // Informations Wi-Fi
 const char* ssid = "PelucheGang";
@@ -14,7 +15,7 @@ const char* password = "CACHE-CACHEKILLER";
 const char* mqtt_server = "192.168.0.139";
 const char* mqtt_user = "DjiooDanTae";
 const char* mqtt_password = "DjioopPod";
-const char* esp32_id = "Peluche10"; // Identifiant unique pour cet ESP32
+const char* esp32_id = "Peluche10";  // Identifiant unique pour cet ESP32
 
 // MQTT
 WiFiClient espClient;
@@ -64,17 +65,20 @@ int RSSI[MAX_PLAYERS];
 int Player[MAX_PLAYERS];
 
 int closestPlayer = -1;
-int maxRSSI = -1000; // Valeur initiale très faible
+int maxRSSI = -1000;  // Valeur initiale très faible
 
 // BLE
-BLEScan* pBLEScan;
-#define SCAN_TIME 5
+// BLEScan* pBLEScan;
+// #define SCAN_TIME 5
+NimBLEScan* pBLEScan;
+#define SCAN_TIME 3000
 int SpottedPlayer[MAX_PLAYERS];
 
 // Tâches FreeRTOS
 TaskHandle_t wifiTaskHandle;
 TaskHandle_t gameLogicTaskHandle;
 TaskHandle_t bleScanTaskHandle;
+TaskHandle_t audioTaskHandle;
 
 // Prototypes
 void connectToWiFi();
@@ -86,41 +90,139 @@ void gameLogicTask(void* parameter);
 void bleScanTask(void* parameter);
 void determineClosestPlayer();
 
+
+// ----- AUDIO COMMANDS -----
+enum AudioCmdType { AUD_PLAY,
+                    AUD_LOOP,
+                    AUD_STOP,
+                    AUD_VOL };
+struct AudioCmd {
+  AudioCmdType type;
+  uint16_t track;  // pour PLAY/LOOP
+  uint8_t volume;  // pour VOL (0..30)
+};
+
+QueueHandle_t audioQ = nullptr;
+
+inline void audioPlay(uint16_t track) {
+  AudioCmd c{ AUD_PLAY, track, 0 };
+  xQueueSend(audioQ, &c, 0);
+}
+inline void audioLoop(uint16_t track) {
+  AudioCmd c{ AUD_LOOP, track, 0 };
+  xQueueSend(audioQ, &c, 0);
+}
+inline void audioStop() {
+  AudioCmd c{ AUD_STOP, 0, 0 };
+  xQueueSend(audioQ, &c, 0);
+}
+inline void audioSetVol(uint8_t v) {
+  AudioCmd c{ AUD_VOL, 0, v };
+  xQueueSend(audioQ, &c, 0);
+}
+
+// --- Lecteur minimal : 1 en cours + 1 en attente ---
+volatile bool dfp_playing = false;
+volatile bool dfp_looping = false;
+volatile int dfp_current = -1;
+volatile int dfp_next = -1;
+volatile bool dfp_next_loop = false;
+volatile uint32_t dfp_started_ms = 0;
+
+const uint32_t DFP_GAP_MS = 300;          // délai entre 2 trames
+const uint32_t DFP_WATCHDOG_MS = 180000;  // 3 min secours si pas d’événement
+
+static void dfpStartNow(int track, bool loop) {
+  if (loop) myDFPlayer.loop(track);
+  else myDFPlayer.play(track);
+  dfp_playing = true;
+  dfp_looping = loop;
+  dfp_current = track;
+  dfp_started_ms = millis();
+  vTaskDelay(pdMS_TO_TICKS(DFP_GAP_MS));
+}
+
+
 //-------------------------------------------------------------------------------------------------------------------------- Initialisation -------------------------------------------------------------------------------------------------------------------------
 
 // Classe pour gérer les callbacks BLE
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) {
-    if (advertisedDevice.haveName() && String(advertisedDevice.getName().c_str()).startsWith("ESP32:Player")) {
-      Serial.println("Cible détectée !");
-      Serial.print("RSSI : ");
-      Serial.println(advertisedDevice.getRSSI());
+// class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+//   void onResult(BLEAdvertisedDevice advertisedDevice) {
+//     if (advertisedDevice.haveName() && String(advertisedDevice.getName().c_str()).startsWith("ESP32:Player")) {
+//       Serial.println("Cible détectée !");
+//       Serial.print("RSSI : ");
+//       Serial.println(advertisedDevice.getRSSI());
 
-      if (advertisedDevice.haveManufacturerData()) {
-        String manufacturerData = advertisedDevice.getManufacturerData();
-        Serial.print("Combined Data: ");
-        Serial.println(manufacturerData);
+//       if (advertisedDevice.haveManufacturerData()) {
+//         String manufacturerData = advertisedDevice.getManufacturerData();
+//         Serial.print("Combined Data: ");
+//         Serial.println(manufacturerData);
 
-        int playerIndex = manufacturerData.indexOf("P:");
-        int etatIndex = manufacturerData.indexOf("E:");
-        if (playerIndex != -1 && etatIndex != -1) {
-          String player = manufacturerData.substring(playerIndex + 2, etatIndex - 1);
-          String etat = manufacturerData.substring(etatIndex + 2);
-          Serial.print("Player: ");
-          Serial.println(player);
-          Serial.print("Etat: ");
-          Serial.println(etat);
-          int playerId = player.toInt();
-          if (playerId >= 0 && playerId < MAX_PLAYERS) {
-            SpottedPlayer[playerId] = etat.toInt();
-            RSSI[playerId] = advertisedDevice.getRSSI();
-            Player[playerId] = playerId;
+//         int playerIndex = manufacturerData.indexOf("P:");
+//         int etatIndex = manufacturerData.indexOf("E:");
+//         if (playerIndex != -1 && etatIndex != -1) {
+//           String player = manufacturerData.substring(playerIndex + 2, etatIndex - 1);
+//           String etat = manufacturerData.substring(etatIndex + 2);
+//           Serial.print("Player: ");
+//           Serial.println(player);
+//           Serial.print("Etat: ");
+//           Serial.println(etat);
+//           int playerId = player.toInt();
+//           if (playerId >= 0 && playerId < MAX_PLAYERS) {
+//             SpottedPlayer[playerId] = etat.toInt();
+//             RSSI[playerId] = advertisedDevice.getRSSI();
+//             Player[playerId] = playerId;
+//           }
+//         }
+//       }
+//     }
+//   }
+// };
+
+class MyScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    // Serial.printf("Advertised Device Result: %s \n", advertisedDevice->toString().c_str());
+    if (advertisedDevice->haveName()) {
+      String devName = String(advertisedDevice->getName().c_str());
+      if (devName.startsWith("Player")) {
+        int rssi = advertisedDevice->getRSSI();
+
+        String manufacturerData;
+        if (advertisedDevice->haveManufacturerData()) {
+          std::string md = advertisedDevice->getManufacturerData();
+          manufacturerData = String(md.c_str());
+        }
+
+        String key = devName;  // ex: "Player3"
+        int spotted = 0;
+        if (manufacturerData.length()) {
+          int eIdx = manufacturerData.indexOf("E:");
+          if (eIdx != -1) {
+            String eStr = manufacturerData.substring(eIdx + 2);
+            spotted = eStr.toInt();  // 0/1
           }
+        }
+
+        int slot = findSlotByKey(key);
+        if (slot < 0) slot = findFreeOrOldestSlot();
+        players[slot].key = key;
+        players[slot].rssi = rssi;
+        players[slot].spotted = spotted;
+        players[slot].lastSeen = millis();
+
+        Serial.printf("[BLE] %s  RSSI=%d  E:%d  -> slot %d\n",
+                      key.c_str(), rssi, spotted, slot);
+
+        if (spotted == 1 && rssi > -100) {
+          ShockTime = millis();
         }
       }
     }
   }
-};
+  void onScanEnd(NimBLEScanResults results) {
+    // rien (certaines versions requièrent l'implémentation)
+  }
+} scanCallbacks;
 
 void setup() {
   // Configuration des broches du capteur ultrason
@@ -144,28 +246,44 @@ void setup() {
   Serial.println("Initialisation du DFPlayer Mini...");
   if (!myDFPlayer.begin(Serial2)) {
     Serial.println("Impossible de communiquer avec le DFPlayer Mini !");
-    while (true);
+    while (true)
+      ;
   }
   Serial.println("DFPlayer Mini initialisé.");
+  myDFPlayer.volume(30);
 
   digitalWrite(LED, HIGH);
   digitalWrite(LED2, HIGH);
   digitalWrite(LED3, HIGH);
   digitalWrite(LED4, HIGH);
 
-  // Initialisation BLE
-  Serial.println("Initialisation du scanner BLE...");
-  BLEDevice::init("");
-  pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setActiveScan(true);
-  pBLEScan->setInterval(20);
-  pBLEScan->setWindow(20);
+  // // Initialisation BLE
+  // Serial.println("Initialisation du scanner BLE...");
+  // BLEDevice::init("");
+  // pBLEScan = BLEDevice::getScan();
+  // pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  // pBLEScan->setActiveScan(true);
+  // pBLEScan->setInterval(20);
+  // pBLEScan->setWindow(20);
+
+  // --- NimBLE init ---
+  NimBLEDevice::init("");
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&scanCallbacks);
+  pBLEScan->setActiveScan(true);  // Scan actif pour plus de données
+  pBLEScan->setInterval(100);     // ms
+  pBLEScan->setWindow(25);        // ms (<= interval)
+  // pBLEScan->setDuplicateFilter(true);
+
+
+  // Ajout d'une pause pour éviter les bugs d'initialisation
+  delay(2000);
 
   // Création des tâches FreeRTOS
-  xTaskCreatePinnedToCore(wifiTask, "WiFiTask", 4096, NULL, 1, &wifiTaskHandle, 0);
-  xTaskCreatePinnedToCore(gameLogicTask, "GameLogicTask", 4096, NULL, 1, &gameLogicTaskHandle, 1);
+  xTaskCreatePinnedToCore(wifiTask, "WiFiTask", 8192, NULL, 2, &wifiTaskHandle, 0);
+  xTaskCreatePinnedToCore(gameLogicTask, "GameLogicTask", 8192, NULL, 4, &gameLogicTaskHandle, 1);
   xTaskCreatePinnedToCore(bleScanTask, "BLEScanTask", 4096, NULL, 1, &bleScanTaskHandle, 0);
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 4096, NULL, 3, &audioTaskHandle, 1);
 }
 
 void loop() {
@@ -173,6 +291,74 @@ void loop() {
 }
 
 //-------------------------------------------------------------------------------------------------------------------------- Wifi et BLE -------------------------------------------------------------------------------------------------------------------------
+
+void audioTask(void*) {
+  const TickType_t idleDelay = pdMS_TO_TICKS(5);
+  AudioCmd cmd;
+
+  for (;;) {
+    // 1) Récupère toutes les commandes envoyées par audioPlay/Loop/Stop/Vol
+    while (xQueueReceive(audioQ, &cmd, 0) == pdTRUE) {
+      switch (cmd.type) {
+        case AUD_PLAY:
+          if (!dfp_playing) dfpStartNow(cmd.track, false);
+          else {
+            dfp_next = (int)cmd.track;
+            dfp_next_loop = false;
+          }
+          break;
+
+        case AUD_LOOP:
+          if (!dfp_playing) dfpStartNow(cmd.track, true);
+          else {
+            dfp_next = (int)cmd.track;
+            dfp_next_loop = true;
+          }
+          break;
+
+        case AUD_STOP:
+          myDFPlayer.stop();
+          dfp_playing = false;
+          dfp_looping = false;
+          dfp_current = -1;
+          dfp_next = -1;  // on efface aussi l’attente
+          vTaskDelay(pdMS_TO_TICKS(DFP_GAP_MS));
+          break;
+
+        case AUD_VOL:
+          myDFPlayer.volume(constrain(cmd.volume, 0, 30));
+          vTaskDelay(pdMS_TO_TICKS(DFP_GAP_MS));
+          break;
+      }
+    }
+
+    // 2) Fin de piste par événement série (safe)
+    if (myDFPlayer.available()) {
+      uint8_t t = myDFPlayer.readType();
+      (void)myDFPlayer.read();  // consomme la valeur associée si présente
+      if (t == DFPlayerPlayFinished) {
+        dfp_playing = false;  // la piste non-loop vient de finir
+        noDetection = false;
+      }
+      // (option) gérer DFPlayerError ici
+    }
+
+    // 3) Watchdog de secours si l’événement n’arrive pas (clones capricieux)
+    if (dfp_playing && !dfp_looping) {
+      if (millis() - dfp_started_ms > DFP_WATCHDOG_MS) {
+        dfp_playing = false;  // on considère la piste terminée
+      }
+    }
+
+    // 4) Si libre et une piste est en attente, on la lance
+    if (!dfp_playing && dfp_next != -1) {
+      dfpStartNow(dfp_next, dfp_next_loop);
+      dfp_next = -1;
+    }
+
+    vTaskDelay(idleDelay);
+  }
+}
 
 void wifiTask(void* parameter) {
   vTaskDelay(5000 / portTICK_PERIOD_MS);
@@ -190,7 +376,7 @@ void wifiTask(void* parameter) {
 }
 
 void bleScanTask(void* parameter) {
-   vTaskDelay(15000 / portTICK_PERIOD_MS);
+  vTaskDelay(15000 / portTICK_PERIOD_MS);
   while (true) {
     Serial.println("Scan BLE en cours...");
     pBLEScan->start(SCAN_TIME, false);
@@ -242,14 +428,14 @@ void reconnectMQTT() {
   int attemptCount = 0;
   while (!client.connected()) {
     Serial.println("Connexion au broker MQTT...");
-    
+
     if (client.connect(esp32_id, mqtt_user, mqtt_password, willTopic.c_str(), 1, true, willMessage.c_str())) {
       Serial.println("Connecté au broker MQTT");
       String onlineMessage = String(esp32_id) + ":online";
       client.publish(willTopic.c_str(), onlineMessage.c_str(), true);
       client.subscribe("unity/commandes");
       sendMQTTMessage("Request");
-      attemptCount = 0; // Réinitialisation du compteur d'échec
+      attemptCount = 0;  // Réinitialisation du compteur d'échec
     } else {
       Serial.print("Échec, rc=");
       Serial.print(client.state());
@@ -260,7 +446,7 @@ void reconnectMQTT() {
       if (attemptCount >= 5) {
         Serial.println("Trop d'échecs de connexion MQTT, redémarrage du Wi-Fi...");
         connectToWiFi();
-        attemptCount = 0; // Réinitialiser le compteur après reconnexion
+        attemptCount = 0;  // Réinitialiser le compteur après reconnexion
       }
 
       vTaskDelay(5000 / portTICK_PERIOD_MS);
@@ -280,7 +466,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print(": ");
   Serial.println(message);
 
-   if (message.endsWith(":reset")) {
+  if (message.endsWith(":reset")) {
     led = 0;
     isplaying = false;
     isplaying2 = false;
@@ -290,34 +476,30 @@ void callback(char* topic, byte* payload, unsigned int length) {
     Serial.println("Commande reset reçue");
   }
 
-  if (message.startsWith(String("Peluche:difficulte(")))
-  {
+  if (message.startsWith(String("Peluche:difficulte("))) {
     Serial.println("Good");
     int startIdx = message.indexOf("(") + 1;
     int endIdx = message.indexOf(")");
     String difficultyStr = message.substring(startIdx, endIdx);
     float difficultyLevel = difficultyStr.toFloat();
-    Serial.println("diffStr: " + String(difficultyLevel, 2)); // Affichage avec 2 décimales
-    vitDiff = 1 - (difficultyLevel/20);
-    Serial.println("diff: " + String(vitDiff, 2)); // Affichage avec 2 décimales
+    Serial.println("diffStr: " + String(difficultyLevel, 2));  // Affichage avec 2 décimales
+    vitDiff = 1 - (difficultyLevel / 20);
+    Serial.println("diff: " + String(vitDiff, 2));  // Affichage avec 2 décimales
   }
 
-  if (message == (String(esp32_id) + ":inactive"))
-  {
+  if (message == (String(esp32_id) + ":inactive")) {
     PelucheActive = false;
     OffMSG = true;
     sendMQTTMessage("off");
   }
 
-  if (message == (String(esp32_id) + ":active"))
-  {
+  if (message == (String(esp32_id) + ":active")) {
     PelucheActive = true;
     OnMSG = true;
     Serial.println(PelucheActive);
     sendMQTTMessage("on");
-  }  
-   if (message == (String(esp32_id) + ":win2"))
-  {
+  }
+  if (message == (String(esp32_id) + ":win2")) {
     PelucheActive = false;
     WinGate = true;
   }
@@ -331,7 +513,7 @@ void sendMQTTMessage(const char* message) {
   Serial.println("Message envoyé : " + fullMessage);
 }
 
-void determineClosestPlayer() {  
+void determineClosestPlayer() {
 
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (RSSI[i] > maxRSSI) {
@@ -358,14 +540,14 @@ void gameLogicTask(void* parameter) {
     // long duration =0;  // Timeout 30ms
     // bool distance = 0;  // Conversion en cm
 
-    if (uint8_t state = myDFPlayer.readState() == 1)
-    {
-      noDetection = true;
-    }
-    else 
-    {
-      noDetection = false;
-    }
+    // if (uint8_t state = myDFPlayer.readState() == 1)
+    // {
+    //   noDetection = true;
+    // }
+    // else
+    // {
+    //   noDetection = false;
+    // }
     // if (!noDetection)
     // {
     // digitalWrite(TRIG_PIN, LOW);
@@ -373,102 +555,95 @@ void gameLogicTask(void* parameter) {
     // digitalWrite(TRIG_PIN, HIGH);
     // delayMicroseconds(10);
     // digitalWrite(TRIG_PIN, LOW);
-    
+
     // duration = pulseIn(ECHO_PIN, HIGH, 30000);  // Timeout 30ms
     // distance = (duration * 0.034) / 2;  // Conversion en cm
     // }
 
-    int etatPIR = digitalRead(PIR_PIN);  
+    int etatPIR = digitalRead(PIR_PIN);
 
     // Attendre que le PIR revienne à LOW avant de réactiver la détection
     if (etatPIR == LOW && mouvementDetecte) {
-        mouvementDetecte = false;  // Réinitialise la validation
+      mouvementDetecte = false;  // Réinitialise la validation
     }
 
-    if(!PelucheActive && WinGate)
-    {
-            digitalWrite(LED, HIGH);
-        digitalWrite(LED2, HIGH);
-        digitalWrite(LED3, HIGH);
-        digitalWrite(LED4, HIGH);
-        if(!EndLoop)
-        {
-        myDFPlayer.volume(30);
-        myDFPlayer.loop(21);
+    if (!PelucheActive && WinGate) {
+      digitalWrite(LED, HIGH);
+      digitalWrite(LED2, HIGH);
+      digitalWrite(LED3, HIGH);
+      digitalWrite(LED4, HIGH);
+      if (!EndLoop) {
+        audioLoop(21);
         EndLoop = true;
-        }
+      }
     }
-    
 
-    if (!PelucheActive)
-    {
+
+    if (!PelucheActive) {
       digitalWrite(LED, LOW);
-        digitalWrite(LED2, LOW);
-        digitalWrite(LED3, LOW);
-        digitalWrite(LED4, LOW);
-        isplaying = false;
-          isplaying2 = false;
-          led = 0;
+      digitalWrite(LED2, LOW);
+      digitalWrite(LED3, LOW);
+      digitalWrite(LED4, LOW);
+      isplaying = false;
+      isplaying2 = false;
+      led = 0;
       mouvementDetecte = false;
 
-    //     if (OffMSG)
-    //     {
-    //       vTaskDelay(pdMS_TO_TICKS(500));
-    // myDFPlayer.stop();
-    // vTaskDelay(pdMS_TO_TICKS(500));
-    //     myDFPlayer.volume(15);
-    //     vTaskDelay(pdMS_TO_TICKS(500));
-    //     int valeur [] = {4,5,15};
-    //     int randomTrack = random(0,3);
-    //     myDFPlayer.play(valeur[randomTrack]);
-    //     vTaskDelay(pdMS_TO_TICKS(500));
-    //     OffMSG = false;
-    //     }
+      //     if (OffMSG)
+      //     {
+      //       vTaskDelay(pdMS_TO_TICKS(500));
+      // myDFPlayer.stop();
+      // vTaskDelay(pdMS_TO_TICKS(500));
+      //     myDFPlayer.volume(15);
+      //     vTaskDelay(pdMS_TO_TICKS(500));
+      //     int valeur [] = {4,5,15};
+      //     int randomTrack = random(0,3);
+      //     myDFPlayer.play(valeur[randomTrack]);
+      //     vTaskDelay(pdMS_TO_TICKS(500));
+      //     OffMSG = false;
+      //     }
     }
     //Serial.println(PelucheActive);
-    if (PelucheActive){
+    if (PelucheActive) {
       // led = 0;
       // mouvementDetecte = false;
       // if (OnMSG)
-    //   {
-    //      vTaskDelay(pdMS_TO_TICKS(500));
-    // myDFPlayer.stop();
-    // vTaskDelay(pdMS_TO_TICKS(500));
-    //     myDFPlayer.volume(20);
-    //     vTaskDelay(pdMS_TO_TICKS(500));
-    //     myDFPlayer.play(7);
-    //     vTaskDelay(pdMS_TO_TICKS(500));
-    //     OnMSG = false;
+      //   {
+      //      vTaskDelay(pdMS_TO_TICKS(500));
+      // myDFPlayer.stop();
+      // vTaskDelay(pdMS_TO_TICKS(500));
+      //     myDFPlayer.volume(20);
+      //     vTaskDelay(pdMS_TO_TICKS(500));
+      //     myDFPlayer.play(7);
+      //     vTaskDelay(pdMS_TO_TICKS(500));
+      //     OnMSG = false;
       // }
       //Serial.print("Good");
-    // long duration;
-    // float distance;
+      // long duration;
+      // float distance;
 
-    if (led > 3) {
-      led = 3;
-    }
+      if (led > 3) {
+        led = 3;
+      }
 
-    // distance = getStableDistance();
-    // Serial.println(distance);
-      if (millis() - LastSpot > (vitDetection * vitDiff) && etatPIR == HIGH && !mouvementDetecte && closestPlayer == 9){
+      // distance = getStableDistance();
+      // Serial.println(distance);
+      if (millis() - LastSpot > (vitDetection * vitDiff) && etatPIR == HIGH && !mouvementDetecte && closestPlayer == 9) {
         LastSpot = millis();
         noDetection = true;
         sendMQTTMessage("Killer detected");
-        vTaskDelay(pdMS_TO_TICKS(300));
-        myDFPlayer.volume(20);
-        vTaskDelay(pdMS_TO_TICKS(300));
-        int valeur [] = {17,18,19,20};
-        int randomTrack = random(0,4);
-         myDFPlayer.play(valeur[randomTrack]);
-        vTaskDelay(pdMS_TO_TICKS(300));
+        int valeur[] = { 17, 18, 19, 20 };
+        int randomTrack = random(0, 4);
+        audioPlay(randomTrack);
       }
 
       if (millis() - LastSpot > (vitDetection * vitDiff) && etatPIR == HIGH && !mouvementDetecte && !noDetection && closestPlayer != 9) {
-        LastSpot = millis();        
+        LastSpot = millis();
         mouvementDetecte = true;  // Bloque les nouvelles détections
         led += 1;
         CurrentTime = millis();
         End = millis();
+        noDetection = true;
       }
 
 
@@ -488,16 +663,13 @@ void gameLogicTask(void* parameter) {
         //         // vTaskDelay(pdMS_TO_TICKS(500));
         //     }
         // }
-      }  if (led == 1) {
+      }
+      if (led == 1) {
         if (!isplaying2) {
           noDetection = true;
-          vTaskDelay(pdMS_TO_TICKS(300));
-          myDFPlayer.volume(30);
-          vTaskDelay(pdMS_TO_TICKS(300));
-          int valeur [] = {2,6,8, 12, 13, 16, 4, 5, 15, 7};
-          int randomTrack = random(0,10);
-          myDFPlayer.play(valeur[randomTrack]);
-          vTaskDelay(pdMS_TO_TICKS(300));
+          int valeur[] = { 2, 6, 8, 12, 13, 16, 4, 5, 15, 7 };
+          int randomTrack = random(0, 10);
+          audioPlay(randomTrack);
           isplaying2 = true;
           ShortVoice = millis();
         }
@@ -530,7 +702,7 @@ void gameLogicTask(void* parameter) {
           LastSpot = millis();
         }
 
-        if (millis() - End < 5000) { 
+        if (millis() - End < 5000) {
           if (millis() - LedTime > 300) {
             if (digitalRead(LED) == 1) {
               digitalWrite(LED, LOW);
@@ -547,16 +719,13 @@ void gameLogicTask(void* parameter) {
             }
           }
         }
-      } if (led >= 2) {
+      }
+      if (led >= 2) {
         if (!isplaying) {
           noDetection = true;
-          vTaskDelay(pdMS_TO_TICKS(300));
-          myDFPlayer.volume(30);
-          vTaskDelay(pdMS_TO_TICKS(300));
-          int valeur [] = {2,6,8, 12, 13, 16, 4, 5, 15, 7};
-          int randomTrack = random(0,10);
-          myDFPlayer.play(valeur[randomTrack]);
-          vTaskDelay(pdMS_TO_TICKS(300));
+          int valeur[] = { 2, 6, 8, 12, 13, 16, 4, 5, 15, 7 };
+          int randomTrack = random(0, 10);
+          audioPlay(randomTrack);
           sendMQTTMessage("Player detected");
           isplaying = true;
           isplaying2 = false;
@@ -590,12 +759,12 @@ void gameLogicTask(void* parameter) {
           }
         }
       }
-    
 
-    LoopTime = millis();
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-  vTaskDelay(pdMS_TO_TICKS(100));
+
+      LoopTime = millis();
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -603,7 +772,7 @@ void gameLogicTask(void* parameter) {
 //   int numSamples = 5;  // Nombre de mesures pour la moyenne
 //   float total = 0;
 //   int validReadings = 0;
-  
+
 //   for (int i = 0; i < numSamples; i++) {
 //     digitalWrite(TRIG_PIN, LOW);
 //     delayMicroseconds(2);
@@ -629,6 +798,3 @@ void gameLogicTask(void* parameter) {
 //     return -1;  // Retourne -1 si aucune lecture valide
 //   }
 // }
-
-
-
