@@ -2,8 +2,8 @@
 #include <PubSubClient.h>
 #include <IRremote.hpp>
 #include <Adafruit_NeoPixel.h>
-#include <DFRobotDFPlayerMini.h>
 #include <NimBLEDevice.h>
+#include <DFRobotDFPlayerMini.h>
 
 // ---------- Wi-Fi ----------
 const char* ssid = "PelucheGang";
@@ -18,6 +18,15 @@ const char* esp32_id = "Lanterne1";
 #define MOTOR_PIN 13
 #define BUTTON_PIN 23
 #define BUTTON_LED 32
+
+#define RUBLED 25
+#define RUB_LEDS 6
+Adafruit_NeoPixel RubLed(RUB_LEDS, RUBLED, NEO_GRB + NEO_KHZ800);
+
+// --- Animation de respiration pour les munitions en cours de recharge ---
+static uint8_t breath = 80;    // luminosité actuelle (0-255)
+static int8_t dir = 4;         // direction (+/-)
+static uint32_t lastStep = 0;  // chrono
 
 // ---------- IR ----------
 #define IR_SEND_PIN 14
@@ -41,7 +50,11 @@ int munitions = 3;
 unsigned long LastRecharge = 0;
 int Ame = 0;
 bool borneMunition = false;
-unsigned long borneTime = 0;~~
+unsigned long borneTime = 0;
+bool Find = false;
+bool lvlup1 = false;
+bool lvlup2 = false;
+bool lvlup3 = false;
 
 // --- Charge (appui maintenu) ---
 bool isCharging = false;
@@ -97,14 +110,14 @@ void irTask(void* parameter);
 // }
 
 // --- Proximité Borne Munition (hystérésis + timeout) ---
-volatile bool ammoNear = false;       // état courant (dans zone)
-volatile int ammoRSSI = -127;         // dernier RSSI consolidé
-volatile uint32_t ammoLastSeen = 0;   // timestamp dernière vue
+volatile bool ammoNear = false;      // état courant (dans zone)
+volatile int ammoRSSI = -127;        // dernier RSSI consolidé
+volatile uint32_t ammoLastSeen = 0;  // timestamp dernière vue
 
 // Seuils
-constexpr int RSSI_ENTER = -80;       // entrer dans la zone
-constexpr int RSSI_EXIT  = -90;       // sortir de la zone (un peu plus bas que ENTER)
-constexpr uint32_t AMMO_TIMEOUT_MS = 2500;
+constexpr int RSSI_ENTER = -80;  // entrer dans la zone
+constexpr int RSSI_EXIT = -100;  // sortir de la zone (un peu plus bas que ENTER)
+constexpr uint32_t AMMO_TIMEOUT_MS = 5000;
 
 // Meilleur RSSI observé durant le scan en cours (réinitialisé à chaque passe)
 volatile int scanBestRSSI = -127;
@@ -172,10 +185,10 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
       // On peut aussi mettre à jour "en live"
       ammoRSSI = rssi;
       ammoLastSeen = millis();
-      // Serial.printf("[BLE] %s RSSI=%d\n", name, rssi);
+      Serial.printf("[BLE] %s RSSI=%d\n", name, rssi);
     }
   }
-  void onScanEnd(NimBLEScanResults) override {
+  void onScanEnd(NimBLEScanResults) {
     // rien
   }
 } scanCallbacks;
@@ -201,6 +214,8 @@ void setup() {
   ring.fill(ring.Color(255, 0, 0), 0, NUM_LEDS);
   ring.show();
 
+  RubLed.begin();
+
   // DFPlayer (réglages uniquement)
   // ---------- DFPlayer ----------
   Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
@@ -212,8 +227,8 @@ void setup() {
   Serial.println("DFPlayer Mini OK.");
   myDFPlayer.volume(30);
   delay(2000);
-  myDFPlayer.play(4);
-  delay(2000);
+  // myDFPlayer.play(4);
+  // delay(2000);
 
   // WiFi/MQTT config (structure inchangée)
   client.setServer(mqtt_server, 1883);
@@ -312,12 +327,12 @@ void audioTask(void*) {
 
 void bleScanTask(void* parameter) {
   // Scan actif court et fréquent = meilleure réactivité, peu de latence
-  const uint32_t scanMs = 1200;              // ~1.2 s
+  // const uint32_t scanMs = 1200;  // ~1.2 s
   const TickType_t idleDelay = pdMS_TO_TICKS(50);
 
   for (;;) {
-    scanBestRSSI = -127;                      // reset pour ce cycle
-    pBLEScan->start(scanMs / 1000, false);    // bloquant, mais dans SA tâche
+    scanBestRSSI = -127;                // reset pour ce cycle
+    pBLEScan->start(SCAN_TIME, false);  // bloquant, mais dans SA tâche
 
     // Consolidation: si on a vu au moins une "Munition" durant ce cycle
     // ammoRSSI et ammoLastSeen ont déjà été mis à jour dans onResult()
@@ -329,12 +344,12 @@ void bleScanTask(void* parameter) {
     // Si on est déjà "near", on est plus tolérant (RSSI_EXIT)
     bool wantNear;
     if (ammoNear) wantNear = stillFresh && (ammoRSSI >= RSSI_EXIT);
-    else          wantNear = stillFresh && (ammoRSSI >= RSSI_ENTER);
+    else wantNear = stillFresh && (ammoRSSI >= RSSI_ENTER);
 
     if (wantNear != ammoNear) {
       ammoNear = wantNear;
       if (ammoNear) onAmmoProximityStart();
-      else          onAmmoProximityStop();
+      else onAmmoProximityStop();
     }
 
     vTaskDelay(idleDelay);
@@ -358,6 +373,8 @@ void irTask(void* parameter) {
   const TickType_t period = 100 / portTICK_PERIOD_MS;  // même timing que ton delay(120)
   for (;;) {
 
+    renderMunitionBase();
+
     if (munitions > TotalMunition) munitions = TotalMunition;
     if (munitions < 0) munitions = 0;
     // tout en haut de la loop de irTask()
@@ -366,22 +383,26 @@ void irTask(void* parameter) {
 
     btnRaw = (digitalRead(BUTTON_PIN) == LOW);  // actif bas
     if (btnRaw != btn) {                        // changement ?
-      if (millis() - dbTs > 3) btn = btnRaw;    // anti-rebond ~3ms
+      if (millis() - dbTs > 50) btn = btnRaw;   // anti-rebond ~3ms
     } else {
       dbTs = millis();
     }
     bool pressed = btn;
 
+    // if (!dfp_playing)
+    // {
+    //   audioLoop(4);
+    // }
 
-    if (myDFPlayer.available()) {
-      uint8_t type = myDFPlayer.readType();
-      int value = myDFPlayer.read();
-      if (type == DFPlayerPlayFinished) {
-        audioPlay(4);
-        // vTaskDelay(400 / portTICK_PERIOD_MS);
-        // la piste est terminée
-      }
-    }
+    // if (myDFPlayer.available()) {
+    //   uint8_t type = myDFPlayer.readType();
+    //   int value = myDFPlayer.read();
+    //   if (type == DFPlayerPlayFinished) {
+    //     audioPlay(4);
+    //     // vTaskDelay(400 / portTICK_PERIOD_MS);
+    //     // la piste est terminée
+    //   }
+    // }
 
 
     if (millis() - lastIR > 100 && !Shooting && !isCharging && millis() - LastShoot > Cooldown) {
@@ -390,7 +411,7 @@ void irTask(void* parameter) {
     }
     // vTaskDelay(period);
     // if(digitalRead(BUTTON_PIN) == LOW)  Serial.println("BUTTON ok");
-    if (millis() - LastShoot > Cooldown || munitions != 0) {
+    if (millis() - LastShoot > Cooldown && munitions != 0) {
       digitalWrite(BUTTON_LED, HIGH);
       ring.fill(ring.Color(255, 0, 0), 0, NUM_LEDS);
       ring.show();
@@ -425,21 +446,22 @@ void irTask(void* parameter) {
     // lecture bouton (LOW = appuyé car INPUT_PULLUP)
     // bool pressed = (digitalRead(BUTTON_PIN) == LOW);
 
-    if (munitions != TotalMunition && millis() - LastRecharge > Recharge && !borneMunition) {
+    if (munitions != TotalMunition && millis() - LastRecharge > Recharge) {
       munitions += 1;
       LastRecharge = millis();
     }
-    
-    if (borneMuntion && millis() - borneTime > 30000)
-    {
-      munitions = TotalMunition
+
+    if (borneMunition && millis() - borneTime > 20000) {
+      munitions = TotalMunition;
       borneTime = millis();
     }
 
     // démarrage de charge si possible (pas en cooldown, pas déjà en charge)
-    if (!isCharging && (millis() - LastShoot > Cooldown) && pressed && munitions != 0) {
+    if (!isCharging && (millis() - LastShoot > Cooldown) && pressed && munitions != 0 && (millis() - chargeStart > 600)) {
       isCharging = true;
       chargeStart = millis();
+      // audioStop();
+      audioPlay(1);
     }
 
     // progression de charge (UI) ou annulation
@@ -449,6 +471,7 @@ void irTask(void* parameter) {
       // si on relâche AVANT la fin -> annule
       if (!pressed) {
         isCharging = false;
+        audioStop();
         ring.fill(ring.Color(255, 0, 0), 0, NUM_LEDS);
         ring.show();  // retour rouge
         StopVibration();
@@ -473,11 +496,11 @@ void irTask(void* parameter) {
           LastShoot = millis();
           StopVibration();
           Shooting = false;
-          munitions -= 1;
-          doShoot();
           if (munitions == TotalMunition) {
             LastRecharge = millis();
           }
+          munitions -= 1;
+          doShoot();
           // ring.fill(ring.Color(255, 0, 0), 0, NUM_LEDS);
           // ring.show();  // retour rouge
         }
@@ -525,32 +548,44 @@ void irTask(void* parameter) {
     //   }
     // }
 
-    if (Ame >= 20) {
-      Cooldown = 3000;
-      Recharge = 10000;
+    if (Ame >= 50) {
+      Cooldown = 4000;
+      Recharge = 15000;
       TotalMunition = 6;
-      irShoot = 0x0003;
+      irShoot = 0x1003;
+      if (!lvlup3) {
+        audioPlay(6);
+        lvlup3 = true;
+      }
+    }
+
+    else if (Ame >= 25) {
+      Cooldown = 6000;
+      Recharge = 20000;
+      TotalMunition = 5;
+      irShoot = 0x1002;
+      if (!lvlup2) {
+        audioPlay(6);
+        lvlup2 = true;
+      }
     }
 
     else if (Ame >= 10) {
-      Cooldown = 5000;
-      Recharge = 15000;
-      TotalMunition = 5;
-      irShoot = 0x0002;
-    }
-
-    else if (Ame >= 5) {
-      Cooldown = 7000;
-      Recharge = 20000;
-      TotalMunition = 4;
-      irShoot = 0x0001;
-    }
-
-    else if (Ame < 5) {
-      Cooldown = 10000;
+      Cooldown = 8000;
       Recharge = 30000;
+      TotalMunition = 4;
+      irShoot = 0x1001;
+      if (!lvlup1) {
+        audioPlay(6);
+        lvlup1 = true;
+      }
+    }
+
+    else if (Ame < 10) {
+      Cooldown = 10000;
+      Recharge = 40000;
       TotalMunition = 3;
-      irShoot = 0x0001;
+      irShoot = 0x1001;
     }
   }
 }
@@ -576,10 +611,10 @@ void reconnectMQTT() {
     if (client.connect(esp32_id, mqtt_user, mqtt_password)) {
       Serial.println("Connecté");
       // souscrire à SON topic (structure inchangée)
-      String topic = String("esp32/lanterne");
-      client.subscribe(topic.c_str());
+      String topic = String("esp32/lanterne1");
+      client.subscribe("esp32/lanterne1");
       client.subscribe("unity/commandes");
-        Serial.println("Sub sur " + topic);
+      Serial.println("Sub sur " + topic);
     } else {
       Serial.print("Échec MQTT, rc=");
       Serial.print(client.state());
@@ -609,7 +644,7 @@ void doShoot() {
     ring.show();
     vTaskDelay(60 / portTICK_PERIOD_MS);
   }
-  IrSender.sendNEC(irShoot, irCmd, 3);
+  IrSender.sendNEC(irShoot, irCmd, 2);
 }
 
 void drawChargeProgress(float t) {  // t: 0.0 -> 1.0
@@ -634,6 +669,7 @@ void onAmmoProximityStart() {
   Serial.println("[Ammo] PROXIMITY START (≤ -80 dBm)");
   borneMunition = true;
   borneTime = millis();
+
   // EXEMPLES — à adapter :
   // audioPlay(TRACK_FIND);
   // Vibration(180);
@@ -649,7 +685,38 @@ void onAmmoProximityStop() {
   // ring.fill(ring.Color(255, 0, 0), 0, NUM_LEDS); ring.show();   // retour rouge
 }
 
+void renderMunitionBase() {
 
+
+  uint32_t now = millis();
+  if (now - lastStep > 30) {
+    lastStep = now;
+    breath += dir;
+    if (breath > 150) {  // plafond
+      breath = 150;
+      dir = -dir;
+    } else if (breath < 40) {  // plancher
+      breath = 40;
+      dir = -dir;
+    }
+  }
+  RubLed.clear();
+  int n = constrain(munitions, 0, RUB_LEDS);
+  for (int i = 0; i < n; i++) {
+    RubLed.setPixelColor(i, RubLed.Color(255, 0, 0));
+  }
+  RubLed.show();
+
+  if (borneMunition) {
+    int f = constrain(TotalMunition, munitions, RUB_LEDS);
+    {
+      for (int y = munitions; y < f; y++) {
+        RubLed.setPixelColor(y, RubLed.Color(breath, breath/3, 0));
+      }
+      RubLed.show();
+    }
+  }
+}
 
 
 // ============================== CALLBACK (structure inchangée) ==============================
@@ -661,6 +728,13 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (msg.endsWith("RESET")) {
     Serial.println("[RESET] remise à zéro");
     Ame = 0;
+    Cooldown = 10000;
+    Recharge = 30000;
+    TotalMunition = 3;
+    irShoot = 0x0001;
+    lvlup1 = false;
+    lvlup2 = false;
+    lvlup3 = false;
   }
 
   if (msg.endsWith("FIND")) {
@@ -682,8 +756,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 
   if (msg.endsWith("HIT")) {
-    audioPlay(3);
+    audioPlay(5);
     Vibration(255);
-    Ame = +3;
+    Ame += 3;
   }
 }

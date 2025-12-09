@@ -39,6 +39,9 @@ int vol = 0;
 unsigned long startEtat = 0;
 int endEtat = 0;
 unsigned long starting = 0;
+int Damage = 0;
+unsigned long LastaddendTime = 0;
+bool Spot = false;
 
 int Heal = 0;
 unsigned long lastTickTime = 0;
@@ -103,7 +106,8 @@ static const uint8_t TRACK_WIN = 4;   // win
 bool vibration = false;
 // bool Lastvibration = false;
 bool firstIR = false;
-bool findSent = false;
+bool findSent1 = false;
+bool findSent2 = false;
 unsigned long firstIRTime = 0;
 int TickLife = 0;
 bool irIddle = false;
@@ -291,12 +295,14 @@ void VibrationManager() {
   if (currentMillis - starting > 3000 && !irIddle && !irShoot) {
     digitalWrite(LED1, LOW);
     digitalWrite(LED2, LOW);
+    Spot = false;
   }
 
   if (currentMillis - starting < 3000) {
     analogWrite(MOTOR_PIN, 255);
     digitalWrite(LED1, HIGH);
     digitalWrite(LED2, HIGH);
+    Spot = true;
   }
 
   else if (invulnerable) {
@@ -494,9 +500,9 @@ void gameLogicTask(void* parameter) {
     if (IrReceiver.decode()) {
       irIddle = false;
       irShoot = false;
+      Damage = 0;
       auto& d = IrReceiver.decodedIRData;
       IrReceiver.printIRResultShort(&Serial);  // résumé propre (protocole, adresse, commande)
-
 
 
       if (ACCEPT_ANY_CODE) {
@@ -507,9 +513,22 @@ void gameLogicTask(void* parameter) {
           irIddle = true;
           lastValidIrMs = millis();
         }
-        if (d.address == 0x0001 && d.command == 0xA9) {
+        if (d.address == 0x1001 && d.command == 0xA9) {
           ID = 1;
           irShoot = true;
+          Damage = 1;
+          lastValidIrMs = millis();
+        }
+        if (d.address == 0x1002 && d.command == 0xA9) {
+          ID = 1;
+          irShoot = true;
+          Damage = 2;
+          lastValidIrMs = millis();
+        }
+        if (d.address == 0x1003 && d.command == 0xA9) {
+          ID = 1;
+          irShoot = true;
+          Damage = 3;
           lastValidIrMs = millis();
         }
 
@@ -518,9 +537,22 @@ void gameLogicTask(void* parameter) {
           irIddle = true;
           lastValidIrMs = millis();
         }
-        if (d.address == 0x0011 && d.command == 0xA9) {
+        if (d.address == 0x1011 && d.command == 0xA9) {
           ID = 2;
           irShoot = true;
+          Damage = 1;
+          lastValidIrMs = millis();
+        }
+        if (d.address == 0x1012 && d.command == 0xA9) {
+          ID = 2;
+          irShoot = true;
+          Damage = 2;
+          lastValidIrMs = millis();
+        }
+        if (d.address == 0x1013 && d.command == 0xA9) {
+          ID = 2;
+          irShoot = true;
+          Damage = 3;
           lastValidIrMs = millis();
         }
         // mappe l'adresse/commande vers un killerID
@@ -533,6 +565,13 @@ void gameLogicTask(void* parameter) {
       if ((irIddle || irShoot) && invulnerable) {
         digitalWrite(LED1, HIGH);
         digitalWrite(LED2, HIGH);
+        if (millis() - LastaddendTime >= 1000)
+        {
+        LastaddendTime = millis();
+        endEtat += 1000;
+        Heal += 1000;
+        InvulnerableTimer += 1000;
+        }
       }
 
       if (irIddle && !invulnerable) {
@@ -540,9 +579,16 @@ void gameLogicTask(void* parameter) {
           firstIRTime = millis();
           firstIR = true;
         }
-        if (lastValidIrMs - firstIRTime > 3000 && firstIR && !findSent) {
-          sendToLanterne("FIND");
-          findSent = true;
+        if (ID == 1 && lastValidIrMs - firstIRTime > 3000 && firstIR && !findSent1) {
+          sendToLanterne1("FIND");
+          // if (ID == 2) sendToLanterne2("FIND");
+          findSent1 = true;
+        }
+
+         if (ID == 2 && lastValidIrMs - firstIRTime > 3000 && firstIR && !findSent2) {
+          sendToLanterne2("FIND");
+          // if (ID == 2) sendToLanterne2("FIND");
+          findSent2 = true;
         }
         // if (!vibration) {
         //   starting = millis();
@@ -551,34 +597,37 @@ void gameLogicTask(void* parameter) {
       }
 
       if (irShoot && !invulnerable) {
-        TickLife += 1;
+        lastTickTime = millis();
+        TickLife += Damage;
         if (TickLife < 3) {
-          sendToLanterne("TICK");
+          if (ID == 1) sendToLanterne1("TICK");
+          if (ID == 2) sendToLanterne2("TICK");
           tickCount++;
           Heal = 120000;
-          lastTickTime = millis();
+          // lastTickTime = millis();
           lastSentTickCount = tickCount;
           lastTickSentAt = millis();
           publishTickCount(lastSentTickCount);
           // analogWrite(MOTOR_PIN, 255);
           starting = millis();
-          EtatBLE(1, 20000);
+          EtatBLE(1, ((20000 + (difflvl * 1000)) * TickLife));
           // invTime = millis();
-          invulnerableF(10000);
+          invulnerableF((20000 + (difflvl * 1000)) * TickLife);
           audioPlay(TRACK_TICK);
         }
 
         if (TickLife >= 3) {
           // TickLife = 0;
-          sendToLanterne("HIT");
+          if (ID == 1) sendToLanterne1("HIT");
+          if (ID == 2) sendToLanterne2("HIT");
           Serial.println("HIT validé → piste HIT");
+          // lastTickTime = millis();
 
-
-          EtatBLE(1, 60000);
+          EtatBLE(1, (120000 + (difflvl * 6000));
           // invTime = millis();
-          invulnerableF(30000);
-          Heal = 120000;
-          lastTickTime = millis();
+          invulnerableF(120000 + (difflvl * 6000));
+          Heal = 120000 + (difflvl * 6000);
+          
           // Compteur + annonce (HIT_COUNT)
           hitCount++;
           lastSentHitCount = hitCount;
@@ -659,8 +708,11 @@ void gameLogicTask(void* parameter) {
 
     // ----- DÉCROISSANCE SI PLUS DE PRÉSENCE -----
     if (!irBeamPresent() && invulnerable) {
+      if (!Spot)
+      {
       digitalWrite(LED1, LOW);
       digitalWrite(LED2, LOW);
+      }
       irIddle = false;
       irShoot = false;
     }
@@ -671,9 +723,15 @@ void gameLogicTask(void* parameter) {
       // if (reperage < 0) reperage = 0;
       // lastDecayTick = now;
       // if (analogRead(MOTOR_PIN) != 0) analogWrite(MOTOR_PIN, 0);  // PWM 0-255
-      if (findSent) {
-        sendToLanterne("LOST");
-        findSent = false;
+      if (findSent1) {
+        sendToLanterne1("LOST");
+        // sendToLanterne2("LOST");
+        findSent1 = false;
+      }
+      if (findSent2) {
+        sendToLanterne2("LOST");
+        // sendToLanterne2("LOST");
+        findSent2 = false;
       }
       firstIR = false;
       vibration = false;
@@ -708,7 +766,7 @@ void gameLogicTask(void* parameter) {
       // myDFPlayer.volume(0);
     }
 
-    if (millis() - lastTickTime > Heal && TickLife != 0 && !invulnerable && !HealingBorne) {
+    if (millis() - lastTickTime > Heal && TickLife >= 3 && !invulnerable && !HealingBorne) {
       HealTime();
       lastTickTime = millis();
     }
@@ -737,9 +795,15 @@ void gameLogicTask(void* parameter) {
 
 
 // implémentation (place après sendDetectionMessage ou en bas)
-void sendToLanterne(const char* message) {
+void sendToLanterne1(const char* message) {
   String msg = String(esp32_id) + ":" + message;
-  client.publish("esp32/lanterne", msg.c_str(), false);
+  client.publish("esp32/lanterne1", msg.c_str(), false);
+  Serial.println("Send : " + msg);
+}
+
+void sendToLanterne2(const char* message) {
+  String msg = String(esp32_id) + ":" + message;
+  client.publish("esp32/lanterne2", msg.c_str(), false);
   Serial.println("Send : " + msg);
 }
 
@@ -756,9 +820,9 @@ void EtatBLE(int e, int etatTimer) {
 }
 
 void HealTime() {
-  TickLife -= 1;
-  if (TickLife < 0) TickLife = 0;
-  lastTickTime = millis();
+  TickLife = 0;
+  // if (TickLife < 0) TickLife = 0;
+  // lastTickTime = millis();
 }
 
 void HealBorne() {
@@ -989,6 +1053,11 @@ void callback(char* topic, byte* payload, unsigned int length) {
     invulnerable = false;
     Etat = "0";
     TickLife = 0;
+    findSent1 = false;
+    findSent2 = false;
+    firstIR = false;
+    irIddle = false;
+    irShoot = false;
     // burstCount = 0;
   }
 }

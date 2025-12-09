@@ -82,7 +82,7 @@ int KillerTurn = 0;
 bool isLooped = false;
 bool JustOnce = false;
 bool JustOnce2 = false;
-const int NbrTour = 9;
+const int NbrTour = 11;
 int SpottedPlayer = 0;
 float diffLvl = 1;
 unsigned long ShockTime;
@@ -197,11 +197,10 @@ bool anyThreat(int rssiThreshold /*ex: -100*/) {
   for (int i = 0; i < 8; i++) {
     if (players[i].key.length() == 0) continue;
     bool fresh = (now - players[i].lastSeen) <= STALE_MS;
-    if (fresh && players[i].spotted == 1 && players[i].rssi > rssiThreshold)
-    {
+    if (fresh && players[i].spotted == 1 && players[i].rssi > rssiThreshold) {
       playerNameSpotted = i;
       return true;
-    } 
+    }
   }
   return false;
 }
@@ -289,8 +288,8 @@ unsigned long potGoodSince = 0;
 const unsigned long CROCO_HOLD_MS = 50;    // LOW maintenu
 const unsigned long SW_DEBOUNCE_MS = 20;   // stabilité par switch
 const unsigned long MATCH_HOLD_MS = 3000;  // maintien combinaison OK
-const int POT_TIGHT = 500;                 // fenêtre "parfait"
-const int POT_NEAR = 1000;                 // feedback proche (non validant)
+const int POT_TIGHT = 300;                 // fenêtre "parfait"
+const int POT_NEAR = 600;                  // feedback proche (non validant)
 const int POT_HYST = 40;                   // hystérésis autour de POT_TIGHT
 const int POT_OVERSAMPLE = 4;              // x lectures pour réduire le bruit
 const float POT_EMA_ALPHA = 0.25f;         // lissage EMA (0..1)
@@ -345,13 +344,13 @@ static inline bool readSwitchPin(int pin) {
 
 void initAllTargets() {
   // Croco: choisir une borne
-  crocoTargetIdx = random(0, CROCO_N);
+  crocoTargetIdx = esp_random() % CROCO_N;
   crocoOK = false;
   crocoLowSince = 0;
   Serial.printf("[Init] Croco cible GPIO %d\n", CROCO_PINS[crocoTargetIdx]);
 
   // Switches: 3 bits
-  swTarget = (byte)random(0, 8);
+  swTarget = ((byte)(esp_random() % 8));
   swOK = false;
   swInMatch = false;
   swMatchSince = 0;
@@ -359,7 +358,7 @@ void initAllTargets() {
                 (swTarget >> 2) & 1, (swTarget >> 1) & 1, swTarget & 1);
 
   // Pots: somme
-  potTarget = random(600, 7000);
+  potTarget = (esp_random() % (7000 - 600)) + 600;
   potsOK = false;
   potInRange = false;
   potGoodSince = 0;
@@ -368,13 +367,13 @@ void initAllTargets() {
 
 // Change la cible d’UN seul jeu (au hasard, ou impose id=MG_CROC/MG_SWITCHES/MG_POTS)
 void pickNewTarget(int id = -1) {
-  if (id < 0 || id > 2) id = random(0, 3);
+  if (id < 0 || id > 2) id = esp_random() % 3;
   switch ((MiniGameId)id) {
     case MG_CROC:
       {
         int old = crocoTargetIdx;
         int idx;
-        do { idx = random(0, CROCO_N); } while (CROCO_N > 1 && idx == old);
+        do { idx = esp_random() % CROCO_N; } while (CROCO_N > 1 && idx == old);
         crocoTargetIdx = idx;
         crocoOK = false;
         crocoLowSince = 0;
@@ -386,7 +385,7 @@ void pickNewTarget(int id = -1) {
       {
         byte old = swTarget;
         byte tgt;
-        do { tgt = (byte)random(0, 8); } while (tgt == old);
+        do { tgt = (byte)(esp_random() % 8); } while (tgt == old);
         swTarget = tgt;
         swOK = false;
         swInMatch = false;
@@ -400,7 +399,7 @@ void pickNewTarget(int id = -1) {
       {
         int old = potTarget;
         int tgt;
-        do { tgt = random(600, 7000); } while (tgt == old);
+        do { tgt = (esp_random() % (7000 - 600)) + 600; } while (tgt == old);
         potTarget = tgt;
         potsOK = false;
         potInRange = false;
@@ -500,7 +499,7 @@ void updateAllMiniGames() {
 
   // ----- Agrégation -----
   bool ok = (crocoOK && swOK && potsOK);
-  ReglageOK = ok;                         // vérité unique
+  ReglageOK = ok;  // vérité unique
   // digitalWrite(LED_OK, ok ? HIGH : LOW);  // feedback matériel simple
 }
 
@@ -975,7 +974,7 @@ void generatorTask(void* parameter) {
     }
 
     // Après 3 secondes, retour à l’état précédent
-    if (genState == SHOCK && millis() - ShockTime >= 10000 && Shocked) {
+    if (genState == SHOCK && millis() - ShockTime >= (10000 + (difflvl * 1000) && Shocked) {
       audioStop();
       JustOnce = false;
       genState = previousGenState;
@@ -1016,10 +1015,10 @@ void generatorTask(void* parameter) {
           audioPlay(11);
           audioLoop(14);
         }
-        if (turnCount == 0 && ReglageOK && !JustOnce) {
-          audioLoop(1);
-          JustOnce = true;
-        }
+        // if (turnCount == 0 && ReglageOK && !JustOnce) {
+        //   audioLoop(1);
+        //   JustOnce = true;
+        // }
         // if (!ReglageOK && !JustOnce) {
         //   audioStop();
         //   audioPlay(11);
@@ -1031,8 +1030,12 @@ void generatorTask(void* parameter) {
           audioLoop(10);
           // JustOnce = true;
         }
+        if (onRise_ReglageOK(ReglageOK) && turnCount == 0) {
+          audioStop();
+          audioLoop(1);
+        }
 
-        if (!ReglageOK && millis() - Decharge > TimeDecharge) {
+        if (!ReglageOK && millis() - Decharge > (TimeDecharge / RegFalse)) {
           Decharge = millis();
           if (turnCount > 0) turnCount -= 1;
         }
@@ -1055,20 +1058,20 @@ void generatorTask(void* parameter) {
         if (capteur2Passe && digitalRead(MAG_SENSOR_2) == 0) {  // Vérifie si capteur 2 a été activé avant
           if (ReglageOK) {
             turnCount++;
-            audioStop();
-            audioPlay(2);  // piste tour
+            // audioStop();
+            // audioPlay(2);  // piste tour
             audioLoop(10);
           }
           if (!ReglageOK) {
-            int randomTurn = random(0, 5);
+            int randomTurn = esp_random() % 5;
             if (randomTurn > RegFalse) {
               turnCount++;
-              audioStop();
-              audioPlay(2);
+              // audioStop();
+              // audioPlay(2);
               audioLoop(14);
             } else {
-              audioStop();
-              audioPlay(13);
+              // audioStop();
+              // audioPlay(13);
               audioLoop(14);
             }
           }
@@ -1085,7 +1088,7 @@ void generatorTask(void* parameter) {
             JustOnce = false;
           }
           // stopLoopTrack();
-          int randomPick = random(0, 4);
+          int randomPick = esp_random() % 5;
           if (randomPick <= RegFalse) {
             pickNewTarget();
             updateAllMiniGames();
@@ -1101,20 +1104,21 @@ void generatorTask(void* parameter) {
           stateStartTime = millis();
           // stopLoopTrack();
           // audioPlay();  piste phase 1 réussi
-          updateProgressRing(turnCount, NbrTour + diffLvl, 0);  // 🎯 Affichage LED progressif
+          // updateProgressRing(turnCount, NbrTour + diffLvl, 0);  // 🎯 Affichage LED progressif
+          colorFirstHalfGreen(0);
           Serial.println("✅ Niveau 1 validé, passage en WAITING.");
         }
         break;
 
       case WAITING:
         {
-          colorFirstHalfGreen(0);
+          // colorFirstHalfGreen(0);
           Killerholding = true;
           Shocked = true;
           // playLoopedTrack(9, 30);
           if (!JustOnce) {
             // audioStop();
-            audioLoop(9);
+            audioLoop(7);
             JustOnce = true;
           }
 
@@ -1124,7 +1128,7 @@ void generatorTask(void* parameter) {
           // analogWrite(LED_DECORATIVE_PIN3, 255);
           // analogWrite(LED_DECORATIVE_PIN4, 255);
 
-          unsigned long durationMs = (unsigned long)(20000 * diffLvl);  // même durée que votre timer
+          unsigned long durationMs = (unsigned long)(18000 * diffLvl);  // même durée que votre timer
           unsigned long elapsed = millis() - stateStartTime;
           animateWaitingSimple(stateStartTime, durationMs);
 
@@ -1139,11 +1143,11 @@ void generatorTask(void* parameter) {
             ReglageOK = true;
             // mgHasTarget = false;
             audioStop();
+            audioLoop(10);
             JustOnce = false;
             lastTurnDetectedTime = millis();  // Mise à jour de l'heure du dernier tour détecté
             turnCount = 0;
             lastAnnouncedTurn = 0;
-            notifyMQTT("generateur lvl 3");
             Killerholding = false;
             Shocked = false;
             Serial.println("⏳ 3 minutes écoulées, passage en BUTTON_PHASE");
@@ -1171,7 +1175,7 @@ void generatorTask(void* parameter) {
           // playLoopedTrack(4, 30);
           audioLoop(4);
         }
-        analogWrite(LED_DECORATIVE_PIN, random(0, 255));
+        analogWrite(LED_DECORATIVE_PIN, esp_random() % 255);
         // analogWrite(LED_DECORATIVE_PIN2, random(0, 255));
         // analogWrite(LED_DECORATIVE_PIN3, random(0, 255));
         // analogWrite(LED_DECORATIVE_PIN4, random(0, 255));
@@ -1193,35 +1197,35 @@ void generatorTask(void* parameter) {
             audioPlay(11);
             audioLoop(14);
           }
-          if (ReglageOK && !JustOnce) {
-            audioLoop(10);
-            JustOnce = true;
-          }
+          // if (ReglageOK && !JustOnce) {
+          //   audioLoop(10);
+          //   JustOnce = true;
+          // }
           // if (!ReglageOK && !JustOnce) {
           //   audioStop();
           //   audioPlay(11);
           //   // audioLoop(); piste réparation nécessaire
           //   JustOnce = true;
           // }
-          if (onRise_ReglageOK(ReglageOK) && turnCount > 0) {
+          if (onRise_ReglageOK(ReglageOK)) {
             audioStop();
             audioLoop(10);
             // JustOnce = true;
           }
 
 
-          if (!ReglageOK && millis() - Decharge > TimeDecharge) {
+          if (!ReglageOK && millis() - Decharge > (TimeDecharge / RegFalse)) {
             Decharge = millis();
             if (turnCount > 0) turnCount -= 1;
           }
 
           digitalWrite(LED_BUTTON_PIN, LOW);
-          analogWrite(LED_DECORATIVE_PIN, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
+          analogWrite(LED_DECORATIVE_PIN, map(turnCount, 0, NbrTour + (diffLvl * 2), 0, 255));
           // analogWrite(LED_DECORATIVE_PIN2, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
           // analogWrite(LED_DECORATIVE_PIN3, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
           // analogWrite(LED_DECORATIVE_PIN4, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
 
-          updateProgressRing(turnCount, (NbrTour) + diffLvl, 1);   // 🎯 Affichage LED progressif
+          updateProgressRing(turnCount, (NbrTour) + (diffLvl * 2), 1);   // 🎯 Affichage LED progressif
                                                                    // 🔹 Détection du capteur secondaire (doit être activé avant le principal)
           if (digitalRead(MAG_SENSOR_1) == 0 && !capteur2Passe) {  // Anti-rebond
             capteur2Passe = true;
@@ -1230,21 +1234,22 @@ void generatorTask(void* parameter) {
 
           if (capteur2Passe && digitalRead(MAG_SENSOR_2) == 0) {  // Vérifie si capteur 2 a été activé avant
             if (ReglageOK) {
+              if(turnCount == 0) audioStop();
               turnCount++;
-              audioStop();
-              audioPlay(2);  // piste tour
+              // audioStop();
+              // audioPlay(2);  // piste tour
               audioLoop(10);
             }
             if (!ReglageOK) {
-              int randomTurn = random(0, 5);
+              int randomTurn = esp_random() % 5;
               if (randomTurn > RegFalse) {
                 turnCount++;
-                audioStop();
-                audioPlay(2);
+                // audioStop();
+                // audioPlay(2);
                 audioLoop(14);
               } else {
-                audioStop();
-                audioPlay(13);
+                // audioStop();
+                // audioPlay(13);
                 audioLoop(14);
               }
             }
@@ -1252,7 +1257,7 @@ void generatorTask(void* parameter) {
             capteur2Passe = false;  // Réinitialisation
           }
 
-          if (turnCount >= lastAnnouncedTurn + 1 && turnCount < NbrTour + diffLvl) {
+          if (turnCount >= lastAnnouncedTurn + 1 && turnCount < (NbrTour) + (diffLvl * 2)) {
             lastAnnouncedTurn = turnCount;
             if (turnCount < 2) {
               // audioStop();
@@ -1261,7 +1266,7 @@ void generatorTask(void* parameter) {
               JustOnce = false;
             }
             // stopLoopTrack();
-            int randomPick = random(0, 4);
+            int randomPick = esp_random() % 5;
             if (randomPick <= RegFalse) {
               pickNewTarget();
               updateAllMiniGames();
@@ -1269,11 +1274,12 @@ void generatorTask(void* parameter) {
             }
           }
 
-          if (turnCount >= (NbrTour) + diffLvl) {
+          if (turnCount >= (NbrTour * 2) + (diffLvl * 2)) {
             genState = WAITP3;
-            notifyMQTT("generateur reparer");
+            notifyMQTT("generateur lvl 3");
             stateStartTime = millis();
-            updateProgressRing(turnCount, (NbrTour) + diffLvl, 1);
+            // updateProgressRing(turnCount, (NbrTour) + diffLvl, 1);
+            colorFirstHalfGreen(1);
             // stopLoopTrack();
             audioStop();
             JustOnce = false;
@@ -1304,7 +1310,7 @@ void generatorTask(void* parameter) {
           // analogWrite(LED_DECORATIVE_PIN3, 255);
           // analogWrite(LED_DECORATIVE_PIN4, 255);
 
-          unsigned long durationMs = (unsigned long)(30000 * diffLvl);  // même durée que votre timer
+          unsigned long durationMs = (unsigned long)(12000 * diffLvl);  // même durée que votre timer
           unsigned long elapsed = millis() - stateStartTime;
           // animateWaitingSimple(stateStartTime, durationMs);
 
@@ -1345,9 +1351,10 @@ void generatorTask(void* parameter) {
 
           // Si le bouton reste appuyé
           if (buttonPressed) {
-            if (millis() - buttonPressStart >= LONG_PRESS_TIME) {
+            if (millis() - buttonPressStart >= (LONG_PRESS_TIME + (difflvl * 1000)) {
               audioStop();
               JustOnce = false;
+              notifyMQTT("generateur reparer");
               genState = FINISHED;
             }
           }
@@ -1409,8 +1416,8 @@ void generatorTask(void* parameter) {
         // playLoopedTrack(8, 30);
         // audioLoop(8);
         animateShockRing();
-        digitalWrite((LED_BUTTON_PIN), random(0, 2));
-        analogWrite(LED_DECORATIVE_PIN, random(0, 255));
+        digitalWrite(LED_BUTTON_PIN, esp_random() % 2);
+        analogWrite(LED_DECORATIVE_PIN, esp_random() % 255);
         // analogWrite(LED_DECORATIVE_PIN2, random(0, 255));
         // analogWrite(LED_DECORATIVE_PIN3, random(0, 255));
         // analogWrite(LED_DECORATIVE_PIN4, random(0, 255));
@@ -1670,8 +1677,6 @@ void updateProgressRing2(int turnCount, int totalTours) {
     fx1.head = (fx1.head + 1) % span;
   }
 
-  // (SUPPRIMER l’ancienne ligne hueBase… on n’en a plus besoin)
-
   // glow respirant (garde l'effet vivant)
   float breathe = 0.60f + 0.40f * sinf(now * 0.006f);
 
@@ -1730,7 +1735,7 @@ void animateShockRing() {
 
   // 2-3 étincelles blanches aléatoires
   for (int s = 0; s < 3; s++) {
-    int idx = random(NUM_LEDS);
+    int idx = esp_random() % NUM_LEDS;
     ring.setPixelColor(idx, RGB(180, 180, 180));
   }
 
@@ -1833,7 +1838,7 @@ void animateWaitingSimple(unsigned long startMs, unsigned long durationMs) {
 
 
 void colorFirstHalfGreen(int value) {
-  for (int i = 12 * value; i < 12; i++) {
+  for (int i = 12 * value; i < (12 * (value + 1)); i++) {
     ring.setPixelColor(i, ring.Color(0, 255, 0));  // vert
   }
   ring.show();

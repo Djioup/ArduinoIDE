@@ -207,7 +207,7 @@ volatile int dfp_next = -1;
 volatile bool dfp_next_loop = false;
 volatile uint32_t dfp_started_ms = 0;
 
-const uint32_t DFP_GAP_MS = 200;          // délai entre 2 trames
+const uint32_t DFP_GAP_MS = 300;          // délai entre 2 trames
 const uint32_t DFP_WATCHDOG_MS = 180000;  // 3 min secours si pas d’événement
 
 static void dfpStartNow(int track, bool loop) {
