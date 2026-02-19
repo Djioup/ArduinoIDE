@@ -42,6 +42,10 @@ unsigned long starting = 0;
 int Damage = 0;
 unsigned long LastaddendTime = 0;
 bool Spot = false;
+bool alreadyWin = false;
+bool OutWin = false;
+bool Phase3 = false;
+int HealingBorneTick = 30000;
 
 int Heal = 0;
 unsigned long lastTickTime = 0;
@@ -159,6 +163,13 @@ inline void publishTickCount(uint32_t k) {
   Serial.println("[TICK_COUNT] " + payload);
 }
 
+inline void publishTickLife(uint8_t life) {
+  String payload = String(esp32_id) + String(":TICKLIFE=") + String(life);
+  client.publish("esp32/donnees", payload.c_str(), false);
+  Serial.println("[TICKLIFE] " + payload);
+}
+
+
 static inline bool irBeamPresent() {
   return (millis() - lastValidIrMs) < IR_BEAM_HOLD_MS;
 }
@@ -211,7 +222,7 @@ volatile int dfp_next = -1;
 volatile bool dfp_next_loop = false;
 volatile uint32_t dfp_started_ms = 0;
 
-const uint32_t DFP_GAP_MS = 300;          // délai entre 2 trames
+const uint32_t DFP_GAP_MS = 500;          // délai entre 2 trames
 const uint32_t DFP_WATCHDOG_MS = 180000;  // 3 min secours si pas d’événement
 
 static void dfpStartNow(int track, bool loop) {
@@ -226,14 +237,14 @@ static void dfpStartNow(int track, bool loop) {
 
 // --- Healing "breathing" ---
 const uint16_t HEAL_PERIOD_MS = 1600;  // durée d'un cycle complet
-const uint8_t  HEAL_MIN_LVL   = 6;     // intensité mini du bleu pendant healing
-const uint8_t  HEAL_MAX_LVL   = 35;    // intensité maxi du bleu pendant healing
+const uint8_t HEAL_MIN_LVL = 6;        // intensité mini du bleu pendant healing
+const uint8_t HEAL_MAX_LVL = 35;       // intensité maxi du bleu pendant healing
 
 // calcule un niveau 0..255 selon une courbe cos lissée
 inline uint8_t healBreathLevel() {
   uint32_t base = HealingBorne ? (millis() - startHealingBorne) : millis();
-  float x = (base % HEAL_PERIOD_MS) / (float)HEAL_PERIOD_MS;     // 0..1
-  float curve = (1.0f - cosf(2.0f * 3.14159f * x)) * 0.5f;       // 0..1 lissé
+  float x = (base % HEAL_PERIOD_MS) / (float)HEAL_PERIOD_MS;  // 0..1
+  float curve = (1.0f - cosf(2.0f * 3.14159f * x)) * 0.5f;    // 0..1 lissé
   float lvl = HEAL_MIN_LVL + curve * (HEAL_MAX_LVL - HEAL_MIN_LVL);
   return (uint8_t)lvl;
 }
@@ -241,9 +252,9 @@ inline uint8_t healBreathLevel() {
 
 // --- LED render (non-bloquant) ---
 const uint16_t INVUL_PERIOD_MS = 1000;  // période totale du clignotement
-const uint16_t INVUL_FLASH_MS = 90;    // durée du flash blanc
-const uint8_t BLUE_LEVEL = 20;         // intensité du bleu TickLife
-const uint8_t WHITE_LEVEL = 20;        // intensité du flash blanc
+const uint16_t INVUL_FLASH_MS = 90;     // durée du flash blanc
+const uint8_t BLUE_LEVEL = 20;          // intensité du bleu TickLife
+const uint8_t WHITE_LEVEL = 20;         // intensité du flash blanc
 
 // Affichage "de base" = TickLife en bleu
 void renderLifeBase() {
@@ -265,16 +276,16 @@ void renderLEDs() {
         RubLed.setPixelColor(i, RubLed.Color(WHITE_LEVEL, WHITE_LEVEL, WHITE_LEVEL));
       }
       RubLed.show();
-      return; // le flash est prioritaire
+      return;  // le flash est prioritaire
     }
     // sinon on laisse continuer pour afficher le fond après le flash
   }
 
   // 2) HealingBorne : respiration du bleu, en gardant le nombre de LEDs = TickLife
-  if (HealingBorne) {
+  if (HealingBorne && TickLife != 0) {
     RubLed.clear();
     int n = constrain(TickLife, 0, NUM_LEDS);
-    uint8_t lvl = healBreathLevel();      // 6..35 par défaut
+    uint8_t lvl = healBreathLevel();  // 6..35 par défaut
     for (int i = 0; i < n; i++) {
       RubLed.setPixelColor(i, RubLed.Color(0, 0, lvl));
     }
@@ -317,32 +328,32 @@ void VibrationManager() {
     // digitalWrite(26, HIGH);
   }
 
-  else if (HealingBorne) {
-    // cycle de respiration total (ms)
-    const unsigned long period = 1600;
-    const int minPower = 30;
-    const int maxPower = 150;
+  // else if (HealingBorne) {
+  //   // cycle de respiration total (ms)
+  //   const unsigned long period = 1600;
+  //   const int minPower = 30;
+  //   const int maxPower = 150;
 
-    unsigned long now = millis();
-    float x = (now % period) / (float)period;                 // 0..1 dans le cycle
-    float curve = (1.0f - cosf(2.0f * 3.14159f * x)) * 0.5f;  // courbe lisse montée/descente
-    int pwm = (int)(minPower + curve * (maxPower - minPower));
+  //   unsigned long now = millis();
+  //   float x = (now % period) / (float)period;                 // 0..1 dans le cycle
+  //   float curve = (1.0f - cosf(2.0f * 3.14159f * x)) * 0.5f;  // courbe lisse montée/descente
+  //   int pwm = (int)(minPower + curve * (maxPower - minPower));
 
-    analogWrite(MOTOR_PIN, pwm);
-  }
+  //   analogWrite(MOTOR_PIN, pwm);
+  // }
 
 
-  else if (TickLife >= 3) {
-    // Mode double vibration rythmée
-    unsigned long cycle = currentMillis % 3000;  // Durée totale d’un cycle (1.2 seconde)
+  // else if (TickLife >= 3) {
+  //   // Mode double vibration rythmée
+  //   unsigned long cycle = currentMillis % 3000;  // Durée totale d’un cycle (1.2 seconde)
 
-    // Pattern : vibration - 100ms, pause - 100ms, vibration - 100ms, pause - 900ms
-    if ((cycle < 1000)) {
-      analogWrite(MOTOR_PIN, 150);
-    } else {
-      analogWrite(MOTOR_PIN, 0);
-    }
-  }
+  //   // Pattern : vibration - 100ms, pause - 100ms, vibration - 100ms, pause - 900ms
+  //   if ((cycle < 1000)) {
+  //     analogWrite(MOTOR_PIN, 150);
+  //   } else {
+  //     analogWrite(MOTOR_PIN, 0);
+  //   }
+  // }
 
   else {
     analogWrite(MOTOR_PIN, 0);
@@ -555,6 +566,10 @@ void gameLogicTask(void* parameter) {
           Damage = 3;
           lastValidIrMs = millis();
         }
+
+        if (d.address == 0x2222 && d.command == 0xA9 && Phase3) {
+          OutWin = true;
+        }
         // mappe l'adresse/commande vers un killerID
         // ID = mapIrToKillerID(d.address, d.command);
         // Serial.println(ID);
@@ -565,12 +580,12 @@ void gameLogicTask(void* parameter) {
       if ((irIddle || irShoot) && invulnerable) {
         digitalWrite(LED1, HIGH);
         digitalWrite(LED2, HIGH);
-        if (millis() - LastaddendTime >= 1000)
-        {
-        LastaddendTime = millis();
-        endEtat += 1000;
-        Heal += 1000;
-        InvulnerableTimer += 1000;
+        if (millis() - LastaddendTime >= 1000) {
+          LastaddendTime = millis();
+          endEtat += 1000;
+          Heal += 1000;
+          InvulnerableTimer += 1000;
+          HealingBorneTick += 1000;
         }
       }
 
@@ -585,7 +600,7 @@ void gameLogicTask(void* parameter) {
           findSent1 = true;
         }
 
-         if (ID == 2 && lastValidIrMs - firstIRTime > 3000 && firstIR && !findSent2) {
+        if (ID == 2 && lastValidIrMs - firstIRTime > 3000 && firstIR && !findSent2) {
           sendToLanterne2("FIND");
           // if (ID == 2) sendToLanterne2("FIND");
           findSent2 = true;
@@ -603,11 +618,12 @@ void gameLogicTask(void* parameter) {
           if (ID == 1) sendToLanterne1("TICK");
           if (ID == 2) sendToLanterne2("TICK");
           tickCount++;
-          Heal = 120000;
+          // Heal = 120000;
           // lastTickTime = millis();
-          lastSentTickCount = tickCount;
-          lastTickSentAt = millis();
-          publishTickCount(lastSentTickCount);
+          // lastSentTickCount = tickCount;
+          // lastTickSentAt = millis();
+          publishTickCount(tickCount);
+          publishTickLife(TickLife);
           // analogWrite(MOTOR_PIN, 255);
           starting = millis();
           EtatBLE(1, ((20000 + (difflvl * 1000)) * TickLife));
@@ -617,28 +633,34 @@ void gameLogicTask(void* parameter) {
         }
 
         if (TickLife >= 3) {
-          // TickLife = 0;
+          TickLife = 3;
           if (ID == 1) sendToLanterne1("HIT");
           if (ID == 2) sendToLanterne2("HIT");
           Serial.println("HIT validé → piste HIT");
           // lastTickTime = millis();
-
-          EtatBLE(1, (120000 + (difflvl * 6000));
+          publishTickLife(TickLife);
+          EtatBLE(1, (60000 + (difflvl * 6000)));
           // invTime = millis();
-          invulnerableF(120000 + (difflvl * 6000));
-          Heal = 120000 + (difflvl * 6000);
-          
+          invulnerableF(60000 + (difflvl * 6000));
+          Heal = 60000 + (difflvl * 6000);
+
           // Compteur + annonce (HIT_COUNT)
           hitCount++;
-          lastSentHitCount = hitCount;
-          lastHitSentAt = millis();
-          publishHitCount(lastSentHitCount);
+          // lastSentHitCount = hitCount;
+          // lastHitSentAt = millis();
+          publishHitCount(hitCount);
           // analogWrite(MOTOR_PIN, 255);
 
           starting = millis();
 
           audioPlay(2);
         }
+      }
+
+
+      if (OutWin && !alreadyWin) {
+        sendDetectionMessage("OutWinPlayer");
+        alreadyWin = true;
       }
 
       // if (irIddle && !invulnerable) {
@@ -708,10 +730,9 @@ void gameLogicTask(void* parameter) {
 
     // ----- DÉCROISSANCE SI PLUS DE PRÉSENCE -----
     if (!irBeamPresent() && invulnerable) {
-      if (!Spot)
-      {
-      digitalWrite(LED1, LOW);
-      digitalWrite(LED2, LOW);
+      if (!Spot) {
+        digitalWrite(LED1, LOW);
+        digitalWrite(LED2, LOW);
       }
       irIddle = false;
       irShoot = false;
@@ -757,36 +778,37 @@ void gameLogicTask(void* parameter) {
       // invulnerable = false;
       // reperage = 0;
       // sendDetectionMessage("IR_notdetected");
-      if (TickLife == 0) {
+      // if (TickLife == 0) {
         Etat = "0";
-      } else if (TickLife != 0) {
-        Etat = "3";
-      }
+      // } 
+      //  else if (TickLife != 0) {
+      //   Etat = "3";
+      // }
       // digitalWrite(LED, LOW);
       // myDFPlayer.volume(0);
     }
 
-    if (millis() - lastTickTime > Heal && TickLife >= 3 && !invulnerable && !HealingBorne) {
+    if (millis() - lastTickTime > Heal && TickLife >= 3) {
       HealTime();
       lastTickTime = millis();
     }
 
-    //----- RESYNC HIT_COUNT (option réactivée si besoin) -----
-    if (millis() - lastHitSentAt >= RESYNC_PERIOD_MS) {
-      if (lastAckedHitCount != lastSentHitCount && lastSentHitCount != 0) {
-        publishHitCount(lastSentHitCount);
-        // sendToLanterne(lastSeenID, "HIT", lastSentHitCount);
-      }
-      lastHitSentAt = millis();
-    }
+    // //----- RESYNC HIT_COUNT (option réactivée si besoin) -----
+    // if (millis() - lastHitSentAt >= RESYNC_PERIOD_MS) {
+    //   if (lastAckedHitCount != lastSentHitCount && lastSentHitCount != 0) {
+    //     publishHitCount(lastSentHitCount);
+    //     // sendToLanterne(lastSeenID, "HIT", lastSentHitCount);
+    //   }
+    //   lastHitSentAt = millis();
+    // }
 
-    if (millis() - lastTickSentAt >= RESYNC_PERIOD_MS) {
-      if (lastAckedTickCount != lastSentTickCount && lastSentTickCount != 0) {
-        publishTickCount(lastSentTickCount);
-        // sendToLanterne(lastSeenID, "TICK", lastSentTickCount);
-      }
-      lastTickSentAt = millis();
-    }
+    // if (millis() - lastTickSentAt >= RESYNC_PERIOD_MS) {
+    //   if (lastAckedTickCount != lastSentTickCount && lastSentTickCount != 0) {
+    //     publishTickCount(lastSentTickCount);
+    //     // sendToLanterne(lastSeenID, "TICK", lastSentTickCount);
+    //   }
+    //   lastTickSentAt = millis();
+    // }
 
 
     vTaskDelay(8 / portTICK_PERIOD_MS);
@@ -821,15 +843,22 @@ void EtatBLE(int e, int etatTimer) {
 
 void HealTime() {
   TickLife = 0;
+  Etat = "0";
+  publishTickLife(TickLife);
+  HealingBorne = false;
+  invulnerable = false;
   // if (TickLife < 0) TickLife = 0;
   // lastTickTime = millis();
 }
 
 void HealBorne() {
-  int HealingBorneTick = 30000;
-  if (HealingBorne && !invulnerable) {
-    if (millis() - startHealingBorne > HealingBorneTick) {
+  if (HealingBorne) {
+    if (millis() - startHealingBorne > HealingBorneTick && TickLife == 3) {
       TickLife = 0;
+      Etat = "0";
+      publishTickLife(TickLife);
+      invulnerable = false;
+      HealingBorne = false;
     }
   }
 }
@@ -921,15 +950,15 @@ void reconnectMQTT() {
       sendDetectionMessage("on");
       sendDetectionMessage("Request");
 
-      // ✅ Au reconnect, republier les derniers états non ACKés (HIT & TICK)
-      if (lastSentHitCount != 0 && lastAckedHitCount != lastSentHitCount) {
-        publishHitCount(lastSentHitCount);
-        lastHitSentAt = millis();
-      }
-      if (lastSentTickCount != 0 && lastAckedTickCount != lastSentTickCount) {
-        publishTickCount(lastSentTickCount);
-        lastTickSentAt = millis();
-      }
+      // // ✅ Au reconnect, republier les derniers états non ACKés (HIT & TICK)
+      // if (lastSentHitCount != 0 && lastAckedHitCount != lastSentHitCount) {
+      //   publishHitCount(lastSentHitCount);
+      //   lastHitSentAt = millis();
+      // }
+      // if (lastSentTickCount != 0 && lastAckedTickCount != lastSentTickCount) {
+      //   publishTickCount(lastSentTickCount);
+      //   lastTickSentAt = millis();
+      // }
       attemptCount = 0;
     } else {
       Serial.print("Échec MQTT, rc=");
@@ -982,53 +1011,61 @@ void callback(char* topic, byte* payload, unsigned int length) {
     audioPlay(TRACK_WIN);
   }
 
-  if (message.endsWith("LOOSE")) {
+  if (message.endsWith("LOOSE") && !OutWin) {
     Serial.println("LOOSE");
     audioStop();
     audioPlay(TRACK_LOSE);
   }
 
-  // ✅ ACK HIT_COUNT : "Player0:ACK_COUNT=N"
-  if (message.startsWith(String(esp32_id) + ":ACK_COUNT=")) {
-    int eq = message.lastIndexOf('=');
-    if (eq >= 0) {
-      uint32_t k = (uint32_t)strtoul(message.c_str() + eq + 1, nullptr, 10);
-      if (k == lastSentHitCount) {
-        lastAckedHitCount = k;
-        Serial.printf("[ACK HIT] ok for count=%u\n", (unsigned)k);
-      } else {
-        Serial.printf("[ACK HIT] ignoré (attendu=%u, reçu=%u)\n",
-                      (unsigned)lastSentHitCount, (unsigned)k);
-      }
-    }
+  if (message.endsWith("PHASE3_ON")) {
+    Phase3 = true;
+    TickLife = 0;
   }
 
-  // ✅ ACK TICK_COUNT : "Player0:ACK_TICK=N"
-  if (message.startsWith(String(esp32_id) + ":ACK_TICK=")) {
-    int eq = message.lastIndexOf('=');
-    if (eq >= 0) {
-      uint32_t k = (uint32_t)strtoul(message.c_str() + eq + 1, nullptr, 10);
-      if (k == lastSentTickCount) {
-        lastAckedTickCount = k;
-        Serial.printf("[ACK TICK] ok for count=%u\n", (unsigned)k);
-      } else {
-        Serial.printf("[ACK TICK] ignoré (attendu=%u, reçu=%u)\n",
-                      (unsigned)lastSentTickCount, (unsigned)k);
-      }
-    }
-  }
+  // // ✅ ACK HIT_COUNT : "Player0:ACK_COUNT=N"
+  // if (message.startsWith(String(esp32_id) + ":ACK_COUNT=")) {
+  //   int eq = message.lastIndexOf('=');
+  //   if (eq >= 0) {
+  //     uint32_t k = (uint32_t)strtoul(message.c_str() + eq + 1, nullptr, 10);
+  //     if (k == lastSentHitCount) {
+  //       lastAckedHitCount = k;
+  //       Serial.printf("[ACK HIT] ok for count=%u\n", (unsigned)k);
+  //     } else {
+  //       Serial.printf("[ACK HIT] ignoré (attendu=%u, reçu=%u)\n",
+  //                     (unsigned)lastSentHitCount, (unsigned)k);
+  //     }
+  //   }
+  // }
+
+  // // ✅ ACK TICK_COUNT : "Player0:ACK_TICK=N"
+  // if (message.startsWith(String(esp32_id) + ":ACK_TICK=")) {
+  //   int eq = message.lastIndexOf('=');
+  //   if (eq >= 0) {
+  //     uint32_t k = (uint32_t)strtoul(message.c_str() + eq + 1, nullptr, 10);
+  //     if (k == lastSentTickCount) {
+  //       lastAckedTickCount = k;
+  //       Serial.printf("[ACK TICK] ok for count=%u\n", (unsigned)k);
+  //     } else {
+  //       Serial.printf("[ACK TICK] ignoré (attendu=%u, reçu=%u)\n",
+  //                     (unsigned)lastSentTickCount, (unsigned)k);
+  //     }
+  //   }
+  // }
 
   if (message.startsWith(String(esp32_id) + ":SABOTAGE")) {
     // audioPlay(); piste sabotage gen
   }
 
   if (message.startsWith(String(esp32_id) + ":Healing")) {
+    if (!HealingBorne && TickLife >= 3) {
     HealingBorne = true;
+    HealingBorneTick = 30000;
     startHealingBorne = millis();
+    }
   }
 
   if (message.startsWith(String(esp32_id) + ":StopHealing")) {
-    HealingBorne = false;
+    // HealingBorne = false;
   }
 
 
@@ -1037,17 +1074,20 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
     // HIT
     hitCount = 0;
-    lastSentHitCount = 0;
-    lastAckedHitCount = 0;
-    lastHitSentAt = millis();
+    // lastSentHitCount = 0;
+    // lastAckedHitCount = 0;
+    // lastHitSentAt = millis();
     publishHitCount(0);
 
     // ✅ TICK
     tickCount = 0;
-    lastSentTickCount = 0;
-    lastAckedTickCount = 0;
-    lastTickSentAt = millis();
+    // lastSentTickCount = 0;
+    // lastAckedTickCount = 0;
+    // lastTickSentAt = millis();
     publishTickCount(0);
+
+
+    publishTickLife(0);
 
     reperage = 0;
     invulnerable = false;
@@ -1058,6 +1098,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
     firstIR = false;
     irIddle = false;
     irShoot = false;
+    alreadyWin = false;
+    OutWin = false;
+    Phase3 = false;
     // burstCount = 0;
   }
 }

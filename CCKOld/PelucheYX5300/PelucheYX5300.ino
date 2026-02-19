@@ -129,7 +129,7 @@ volatile int dfp_next = -1;
 volatile bool dfp_next_loop = false;
 volatile uint32_t dfp_started_ms = 0;
 
-const uint32_t DFP_GAP_MS = 300;          // délai entre 2 trames
+const uint32_t DFP_GAP_MS = 500;          // délai entre 2 trames
 const uint32_t DFP_WATCHDOG_MS = 180000;  // 3 min secours si pas d’événement
 
 static void dfpStartNow(int track, bool loop) {
@@ -474,6 +474,16 @@ void callback(char* topic, byte* payload, unsigned int length) {
     WinGate = false;
     PelucheActive = false;
     Serial.println("Commande reset reçue");
+  }
+
+  if (message.endsWith(":Door")) {
+    audioStop();
+    audioPlay(21);
+  }
+
+  if (message.endsWith(":PHASE3_ON")) {
+    audioStop();
+    audioPlay(22);
   }
 
   if (message.startsWith(String("Peluche:difficulte("))) {

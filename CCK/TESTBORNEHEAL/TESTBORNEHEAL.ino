@@ -2,22 +2,26 @@
 #include <PubSubClient.h>
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <Adafruit_NeoPixel.h>
 
 // -------------------- Réseau --------------------
-const char* ssid      = "PelucheGang";
-const char* password  = "CACHE-CACHEKILLER";
+const char* ssid = "PelucheGang";
+const char* password = "CACHE-CACHEKILLER";
 const char* mqtt_server = "192.168.0.139";
 const char* mqtt_user = "DjiooDanTae";
 const char* mqtt_pass = "DjioopPod";
-const char* esp32_id  = "HealBorne1";
+const char* esp32_id = "HealBorne1";
 
 // -------------------- MQTT ----------------------
 WiFiClient espClient;
 PubSubClient client(espClient);
-static const char* TOPIC = "unity/commandes";   // topic unique de sortie
+static const char* TOPIC = "unity/commandes";  // topic unique de sortie
 
 // -------------------- NimBLE --------------------
-,nfrrrèyu vb|
+NimBLEScan* pBLEScan = nullptr;
+#define SCAN_TIME_MS 2500
+#define SCAN_INT_MS 120
+#define SCAN_WIN_MS 40
 
 // -------------------- Détection présence --------
 struct Track {
@@ -28,21 +32,22 @@ struct Track {
 };
 
 static Track tracks[16];
-static const unsigned long STALE_MS   = 4000;
-static const int           RSSI_ENTER = -80;
-static const int           RSSI_EXIT  = -100;
+static const unsigned long STALE_MS = 5000;
+static const int RSSI_ENTER = -59;
+static const int RSSI_EXIT = -62;
 
 // -------------------- Protos --------------------
 void connectToWiFi();
 void reconnectMQTT();
 void mqttTask(void*);
 void bleScanTask(void*);
+void LEDTask(void*);
 void publishHealing(const String& name);
 void publishStopHealing(const String& name);
 
 // -------------------- Utils tracking ------------
 static int findByKey(const String& k) {
-  for (int i = 0; i < (int)(sizeof(tracks)/sizeof(tracks[0])); ++i)
+  for (int i = 0; i < (int)(sizeof(tracks) / sizeof(tracks[0])); ++i)
     if (tracks[i].key == k) return i;
   return -1;
 }
@@ -50,12 +55,28 @@ static int allocSlot() {
   int freeIdx = -1;
   unsigned long oldest = ULONG_MAX;
   int oldestIdx = -1;
-  for (int i = 0; i < (int)(sizeof(tracks)/sizeof(tracks[0])); ++i) {
-    if (tracks[i].key.length() == 0) { freeIdx = i; break; }
-    if (tracks[i].lastSeen < oldest) { oldest = tracks[i].lastSeen; oldestIdx = i; }
+  for (int i = 0; i < (int)(sizeof(tracks) / sizeof(tracks[0])); ++i) {
+    if (tracks[i].key.length() == 0) {
+      freeIdx = i;
+      break;
+    }
+    if (tracks[i].lastSeen < oldest) {
+      oldest = tracks[i].lastSeen;
+      oldestIdx = i;
+    }
   }
   return (freeIdx != -1) ? freeIdx : oldestIdx;
 }
+
+
+
+#define LED_PIN 27    // Pin DATA du ruban
+#define LED_COUNT 30  // Nombre de LEDs
+
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+int brightness = 5;
+int fadeAmount = 3;
 
 // -------------------- Callbacks scan ------------
 class MyScanCallbacks : public NimBLEScanCallbacks {
@@ -76,7 +97,7 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
       int eIdx = s.indexOf("E:");
       if (eIdx != -1) eVal = s.substring(eIdx + 2).toInt();
     }
-    if (eVal != 3) return;
+    // if (eVal == 0) return;
 
     int rssi = adv->getRSSI();
     unsigned long now = millis();
@@ -101,7 +122,7 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
     // Sortie (hystérésis) -> réarmer + envoyer StopHealing si tu le veux
     if (wasIn && rssi < RSSI_EXIT) {
       tracks[idx].inE3 = false;
-      publishStopHealing(name);
+      // publishStopHealing(name);
     }
   }
 
@@ -113,10 +134,14 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+
+  strip.begin();
+  strip.show();
+
   // Wi-Fi + MQTT
   connectToWiFi();
   client.setServer(mqtt_server, 1883);
-  client.setCallback([](char*, byte*, unsigned int){ /* rien à écouter */ });
+  client.setCallback([](char*, byte*, unsigned int) { /* rien à écouter */ });
 
   // NimBLE
   NimBLEDevice::init("");
@@ -129,8 +154,8 @@ void setup() {
 
   // Tâches
   xTaskCreatePinnedToCore(mqttTask, "MQTT", 4096, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(bleScanTask, "BLE",  4096, NULL, 1, NULL, 0);
-
+  xTaskCreatePinnedToCore(bleScanTask, "BLE", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(LEDTask, "LED", 4096, NULL, 3, NULL, 1);
   Serial.println("[PresenceBorne] ready");
 }
 
@@ -146,7 +171,7 @@ void mqttTask(void*) {
 
     // Expiration -> réarmement + StopHealing (cohérent côté gameplay)
     unsigned long now = millis();
-    for (int i = 0; i < (int)(sizeof(tracks)/sizeof(tracks[0])); ++i) {
+    for (int i = 0; i < (int)(sizeof(tracks) / sizeof(tracks[0])); ++i) {
       if (tracks[i].key.length() == 0) continue;
       if (tracks[i].inE3 && (now - tracks[i].lastSeen) > STALE_MS) {
         tracks[i].inE3 = false;
@@ -156,6 +181,27 @@ void mqttTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
+void LEDTask(void*) {
+  Serial.println("[LED] task started");
+  for (;;) {
+    brightness += fadeAmount;
+
+    if (brightness <= 0 || brightness >= 255) {
+      fadeAmount = -fadeAmount;
+      // Sécurité si dépassement
+      if (brightness < 0) brightness = 0;
+      if (brightness > 255) brightness = 255;
+    }
+
+    for (int i = 0; i < LED_COUNT; i++) {
+      strip.setPixelColor(i, strip.Color(0, 0, brightness));
+    }
+    strip.show();
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
 
 void bleScanTask(void*) {
   vTaskDelay(pdMS_TO_TICKS(1000));
@@ -184,13 +230,14 @@ void connectToWiFi() {
 void reconnectMQTT() {
   while (!client.connected()) {
     Serial.print("MQTT...");
-    String willTopic   = String("esp32/") + esp32_id + "/status";
+    String willTopic = String("esp32/") + esp32_id + "/status";
     String willPayload = String(esp32_id) + ":offline";
     if (client.connect(esp32_id, mqtt_user, mqtt_pass, willTopic.c_str(), 1, true, willPayload.c_str())) {
       Serial.println(" connected");
-      client.publish(willTopic.c_str(), (String(esp32_id)+":online").c_str(), true);
+      client.publish(willTopic.c_str(), (String(esp32_id) + ":online").c_str(), true);
     } else {
-      Serial.print(" rc="); Serial.println(client.state());
+      Serial.print(" rc=");
+      Serial.println(client.state());
       vTaskDelay(pdMS_TO_TICKS(2000));
     }
   }

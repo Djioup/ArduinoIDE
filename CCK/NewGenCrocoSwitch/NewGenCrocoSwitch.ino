@@ -14,7 +14,7 @@ const char* password = "CACHE-CACHEKILLER";
 const char* mqtt_server = "192.168.0.139";
 const char* mqtt_user = "DjiooDanTae";
 const char* mqtt_password = "DjioopPod";
-const char* esp32_id = "Generator4";
+const char* esp32_id = "Generator5";
 
 // WiFi et MQTT
 WiFiClient espClient;
@@ -33,8 +33,8 @@ const int MAG_SENSOR_1 = 27;
 const int MAG_SENSOR_2 = 14;  // 14
 const int GENERATOR_BUTTON_PIN = 23;
 const int LED_BUTTON_PIN = 22;
-const int LED_DECORATIVE_PIN = 5;  //5
 int RegDiff = 4;
+// const int LED_DECORATIVE_PIN = 5;  //5
 // const int LED_DECORATIVE_PIN2 = 19;
 // const int LED_DECORATIVE_PIN3 = 18;
 // const int LED_DECORATIVE_PIN4 = 33;
@@ -51,7 +51,7 @@ int RegDiff = 4;
 // int mgTargetIdx = -1;  // index du port cible (dans MG_PORTS)
 // bool mgHasTarget = false;
 // --- Pince croco (contacts vers GND, pullup) ---
-const int CROCO_PINS[] = {25, 26, 32, 33 };
+const int CROCO_PINS[] = { 26, 32, 33 };
 const int CROCO_N = sizeof(CROCO_PINS) / sizeof(CROCO_PINS[0]);
 
 // --- Interrupteurs (contacts vers GND, pullup) ---
@@ -59,19 +59,43 @@ const int SW_PINS[] = { 18, 19, 21 };
 const int SW_N = sizeof(SW_PINS) / sizeof(SW_PINS[0]);
 const bool SW_ACTIVE_LOW = true;
 
-// --- Potentiomètres (ADC) ---
-#define POT1 34
-#define POT2 35
+// --- Switchs 3 positions : 2 pins par switch (contacts vers GND, pullup) ---
+const int SW3_PINS[] = { 25, 13, 4, 5 };  // SW0_A, SW0_B, SW1_A, SW1_B
+const bool SW3_ACTIVE_LOW = true;
+
+// Cible (0..2) pour chaque switch 3 positions
+byte sw3Target0 = 0;  // position attendue pour switch 0
+byte sw3Target1 = 0;  // position attendue pour switch 1
+bool sw3OK = false;
+bool sw3InMatch = false;
+unsigned long sw3MatchSince = 0;
+
+static inline bool readActiveLow(int pin) {
+  int v = digitalRead(pin);
+  return SW3_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
+}
+
+// Retourne 0/1/2 (A/milieu/B). Retourne 255 si état invalide (A et B actifs)
+static inline byte read3pos(int pinA, int pinB) {
+  bool a = readActiveLow(pinA);
+  bool b = readActiveLow(pinB);
+
+  if (a && b) return 255;  // invalide
+  if (a) return 0;         // A
+  if (b) return 2;         // B
+  return 1;                // milieu
+}
+
 
 // #define LED_OK 2
 
 
-#define ANNEAULED 13
+#define ANNEAULED 2
 #define NUM_LEDS 24
 Adafruit_NeoPixel ring(NUM_LEDS, ANNEAULED, NEO_GRB + NEO_KHZ800);
 
-#define IND_PIN 4  // <— choisis une pin dispo
-#define IND_NUM 3  // 3 voyants: [0]=croco, [1]=switches, [2]=pots
+#define IND_PIN 12  // <— choisis une pin dispo
+#define IND_NUM 3   // 3 voyants: [0]=croco, [1]=switches, [2]=pots
 Adafruit_NeoPixel indicators(IND_NUM, IND_PIN, NEO_GRB + NEO_KHZ800);
 
 
@@ -285,11 +309,11 @@ bool swOK = false;
 bool swInMatch = false;
 unsigned long swMatchSince = 0;
 
-// POTS (cible somme, fenêtre & stabilité 3 s)
-int potTarget = 0;
-bool potsOK = false;
-bool potInRange = false;
-unsigned long potGoodSince = 0;
+// // POTS (cible somme, fenêtre & stabilité 3 s)
+// int potTarget = 0;
+// bool potsOK = false;
+// bool potInRange = false;
+// unsigned long potGoodSince = 0;
 
 // Fenêtres/temporisations (ajuste si besoin)
 // const unsigned long CROCO_HOLD_MS = 50;
@@ -385,12 +409,21 @@ void initAllTargets() {
   Serial.printf("[Init] Switches cible = %d%d%d\n",
                 (swTarget >> 2) & 1, (swTarget >> 1) & 1, swTarget & 1);
 
-  // Pots: somme
-  potTarget = (esp_random() % (7000 - 600)) + 600;
-  potsOK = false;
-  potInRange = false;
-  potGoodSince = 0;
-  Serial.printf("[Init] Pots cible somme = %d\n", potTarget);
+  // Switchs 3 positions : 2 valeurs 0..2
+  sw3Target0 = (byte)(esp_random() % 3);
+  sw3Target1 = (byte)(esp_random() % 3);
+  sw3OK = false;
+  sw3InMatch = false;
+  sw3MatchSince = 0;
+
+  Serial.printf("[Init] SW3 cible = (S0=%d, S1=%d)\n", sw3Target0, sw3Target1);
+
+  // // Pots: somme
+  // potTarget = (esp_random() % (7000 - 600)) + 600;
+  // potsOK = false;
+  // potInRange = false;
+  // potGoodSince = 0;
+  // Serial.printf("[Init] Pots cible somme = %d\n", potTarget);
 }
 
 // Change la cible d’UN seul jeu (au hasard, ou impose id=MG_CROC/MG_SWITCHES/MG_POTS)
@@ -423,18 +456,34 @@ void pickNewTarget(int id = -1) {
       }
       break;
 
-    case MG_POTS:
+    case MG_POTS:  // réutilisé = SW3
       {
-        int old = potTarget;
-        int tgt;
-        do { tgt = (esp_random() % (7000 - 600)) + 600; } while (tgt == old);
-        potTarget = tgt;
-        potsOK = false;
-        potInRange = false;
-        potGoodSince = 0;
-        Serial.printf("[Target] Pots -> somme %d\n", potTarget);
+        byte old0 = sw3Target0, old1 = sw3Target1;
+        do {
+          sw3Target0 = (byte)(esp_random() % 3);
+          sw3Target1 = (byte)(esp_random() % 3);
+        } while (sw3Target0 == old0 && sw3Target1 == old1);
+
+        sw3OK = false;
+        sw3InMatch = false;
+        sw3MatchSince = 0;
+
+        Serial.printf("[Target] SW3 -> (S0=%d, S1=%d)\n", sw3Target0, sw3Target1);
       }
       break;
+
+      // case MG_POTS:
+      //   {
+      //     int old = potTarget;
+      //     int tgt;
+      //     do { tgt = (esp_random() % (7000 - 600)) + 600; } while (tgt == old);
+      //     potTarget = tgt;
+      //     potsOK = false;
+      //     potInRange = false;
+      //     potGoodSince = 0;
+      //     Serial.printf("[Target] Pots -> somme %d\n", potTarget);
+      //   }
+      //   break;
   }
 }
 void updateAllMiniGames() {
@@ -497,38 +546,70 @@ void updateAllMiniGames() {
       swOK = false;
     }
   }
-
-  // ----- POTS -----
+  // ----- SW3 (2 switchs 3 positions) -----
   {
-    int v1 = analogRead(POT1);
-    int v2 = analogRead(POT2);
-    int sum = v1 + v2;
-    int diff = abs(sum - potTarget);
+    byte p0 = read3pos(SW3_PINS[0], SW3_PINS[1]);
+    byte p1 = read3pos(SW3_PINS[2], SW3_PINS[3]);
 
-    if (diff < POT_TIGHT) {
-      if (!potInRange) {
-        potInRange = true;
-        potGoodSince = now;
+    bool valid = (p0 != 255 && p1 != 255);
+    bool match = valid && (p0 == sw3Target0) && (p1 == sw3Target1);
+
+    if (match) {
+      if (!sw3InMatch) {
+        sw3InMatch = true;
+        sw3MatchSince = now;
       }
-      if (now - potGoodSince >= 50) {
-        potsOK = true;
-        indicators.setPixelColor(2, 0, 255, 0);
-      }
-    } else if (diff < POT_NEAR) {
-      potInRange = false;  // proche mais pas encore validable
-      potsOK = false;
-      indicators.setPixelColor(2, 255, 60, 0);
+      if (now - sw3MatchSince >= 50) sw3OK = true;  // (si tu veux 3s: MATCH_HOLD_MS)
     } else {
-      potInRange = false;
-      potsOK = false;
-      indicators.setPixelColor(2, 255, 0, 0);
+      sw3InMatch = false;
+      sw3OK = false;
+    }
+
+    // Feedback LED indicateur #2
+    if (!valid) {
+      indicators.setPixelColor(2, 255, 0, 255);  // violet = invalide (A et B actifs)
+    } else if (sw3OK) {
+      indicators.setPixelColor(2, 0, 255, 0);  // vert = ok
+    } else {
+      indicators.setPixelColor(2, 255, 0, 0);  // rouge = pas ok
     }
   }
 
   // ----- Agrégation -----
-  bool ok = (crocoOK && swOK && potsOK);
-  ReglageOK = ok;  // vérité unique
-  // digitalWrite(LED_OK, ok ? HIGH : LOW);  // feedback matériel simple
+  bool ok = (crocoOK && swOK && sw3OK);
+  ReglageOK = ok;
+
+  // // ----- POTS -----
+  // {
+  //   int v1 = analogRead(POT1);
+  //   int v2 = analogRead(POT2);
+  //   int sum = v1 + v2;
+  //   int diff = abs(sum - potTarget);
+
+  //   if (diff < POT_TIGHT) {
+  //     if (!potInRange) {
+  //       potInRange = true;
+  //       potGoodSince = now;
+  //     }
+  //     if (now - potGoodSince >= 50) {
+  //       potsOK = true;
+  //       indicators.setPixelColor(2, 0, 255, 0);
+  //     }
+  //   } else if (diff < POT_NEAR) {
+  //     potInRange = false;  // proche mais pas encore validable
+  //     potsOK = false;
+  //     indicators.setPixelColor(2, 255, 60, 0);
+  //   } else {
+  //     potInRange = false;
+  //     potsOK = false;
+  //     indicators.setPixelColor(2, 255, 0, 0);
+  //   }
+  // }
+
+  // // ----- Agrégation -----
+  // bool ok = (crocoOK && swOK && potsOK);
+  // ReglageOK = ok;  // vérité unique
+  // // digitalWrite(LED_OK, ok ? HIGH : LOW);  // feedback matériel simple
 }
 
 void sabotageAllMiniGames() {
@@ -608,14 +689,26 @@ void syncTargetsToCurrent(bool forceOK = true) {
   swOK = true;
 
   // ---------------- POTS : cible = somme actuelle ----------------
-  int v1 = analogRead(POT1);
-  int v2 = analogRead(POT2);
-  int sum = v1 + v2;
+  byte p0 = read3pos(SW3_PINS[0], SW3_PINS[1]);
+  byte p1 = read3pos(SW3_PINS[2], SW3_PINS[3]);
+  if (p0 == 255) p0 = 1;  // fallback milieu si invalide
+  if (p1 == 255) p1 = 1;
 
-  potTarget = sum;
-  potInRange = true;
-  potGoodSince = now - MATCH_HOLD_MS;
-  potsOK = true;
+  sw3Target0 = p0;
+  sw3Target1 = p1;
+
+  sw3InMatch = true;
+  sw3MatchSince = now - MATCH_HOLD_MS;
+  sw3OK = true;
+
+  // int v1 = analogRead(POT1);
+  // int v2 = analogRead(POT2);
+  // int sum = v1 + v2;
+
+  // potTarget = sum;
+  // potInRange = true;
+  // potGoodSince = now - MATCH_HOLD_MS;
+  // potsOK = true;
 
   // ---------------- Agrégation + UI ----------------
   ReglageOK = true;
@@ -629,7 +722,7 @@ void syncTargetsToCurrent(bool forceOK = true) {
   Serial.printf("[SYNC] Croco GPIO=%d | Switches=%d%d%d | Pots somme=%d\n",
                 CROCO_PINS[crocoTargetIdx],
                 (swTarget >> 2) & 1, (swTarget >> 1) & 1, swTarget & 1,
-                potTarget);
+                sw3Target0, sw3Target1);
 }
 
 
@@ -740,6 +833,7 @@ inline uint32_t IC_GREEN() {
 void drawMiniGameIndicators() {
   indicators.setPixelColor(0, crocoOK ? IC_GREEN() : IC_RED());
   indicators.setPixelColor(1, swOK ? IC_GREEN() : IC_RED());
+  indicators.setPixelColor(2, sw3OK ? IC_GREEN() : IC_RED());
   // indicators.setPixelColor(2, potsOK ? IC_GREEN() : IC_RED());
   indicators.show();
 }
@@ -872,12 +966,12 @@ void setup() {
 
   pinMode(GENERATOR_BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_BUTTON_PIN, OUTPUT);
-  pinMode(LED_DECORATIVE_PIN, OUTPUT);
+  // pinMode(LED_DECORATIVE_PIN, OUTPUT);
   // 2  pinMode(LED_DECORATIVE_PIN2, OUTPUT);
   // pinMode(LED_DECORATIVE_PIN3, OUTPUT);
   // pinMode(LED_DECORATIVE_PIN4, OUTPUT);
   digitalWrite(LED_BUTTON_PIN, HIGH);
-  analogWrite(LED_DECORATIVE_PIN, 0);
+  // analogWrite(LED_DECORATIVE_PIN, 0);
   // analogWrite(LED_DECORATIVE_PIN2, 0);
   // analogWrite(LED_DECORATIVE_PIN3, 0);
   // analogWrite(LED_DECORATIVE_PIN4, 0);
@@ -887,8 +981,8 @@ void setup() {
   // digitalWrite(LED_OK, LOW);
   for (int i = 0; i < CROCO_N; ++i) pinMode(CROCO_PINS[i], INPUT_PULLUP);
   for (int i = 0; i < SW_N; ++i) pinMode(SW_PINS[i], INPUT_PULLUP);
-  pinMode(POT1, INPUT);
-  pinMode(POT2, INPUT);
+  for (int i = 0; i < 4; ++i) pinMode(SW3_PINS[i], INPUT_PULLUP);
+
 
   // cibles initiales (une par jeu)
   initAllTargets();  // (code ci-dessous)
@@ -1111,7 +1205,7 @@ void generatorTask(void* parameter) {
       genState = previousGenState;
       updateAllMiniGames();
       drawMiniGameIndicators();
-      NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (potsOK ? 1 : 0);
+      NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (sw3OK ? 1 : 0);
       RegFalse = 3 - NbTrue;
       if (RegFalse < 3) sabotageAllMiniGames();
       if (previousGenState != WAITING || previousGenState != WAITP3) audioLoop(14);
@@ -1150,7 +1244,7 @@ void generatorTask(void* parameter) {
         //   pickNewTarget();  // choisit une broche
         //   JustOnce = false;   // déverrouille les cues audio liés au réglage
         // }
-        NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (potsOK ? 1 : 0);
+        NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (sw3OK ? 1 : 0);
         RegFalse = 3 - NbTrue;
         drawMiniGameIndicators();
 
@@ -1186,7 +1280,7 @@ void generatorTask(void* parameter) {
 
         colorSecondRed();
         digitalWrite(LED_BUTTON_PIN, LOW);
-        analogWrite(LED_DECORATIVE_PIN, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
+        // analogWrite(LED_DECORATIVE_PIN, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
         // analogWrite(LED_DECORATIVE_PIN2, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
         // analogWrite(LED_DECORATIVE_PIN3, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
         // analogWrite(LED_DECORATIVE_PIN4, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
@@ -1271,7 +1365,7 @@ void generatorTask(void* parameter) {
           }
 
           digitalWrite(LED_BUTTON_PIN, LOW);
-          analogWrite(LED_DECORATIVE_PIN, 255);
+          // analogWrite(LED_DECORATIVE_PIN, 255);
           // analogWrite(LED_DECORATIVE_PIN2, 255);
           // analogWrite(LED_DECORATIVE_PIN3, 255);
           // analogWrite(LED_DECORATIVE_PIN4, 255);
@@ -1282,7 +1376,7 @@ void generatorTask(void* parameter) {
           unsigned long elapsed = millis() - stateStartTime;
           animateWaitingSimple(stateStartTime, durationMs);
           updateAllMiniGames();
-          NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (potsOK ? 1 : 0);
+          NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (sw3OK ? 1 : 0);
           RegFalse = 3 - NbTrue;
 
           drawMiniGameIndicators();
@@ -1339,7 +1433,7 @@ void generatorTask(void* parameter) {
           // playLoopedTrack(4, 30);
           audioLoop(4);
         }
-        analogWrite(LED_DECORATIVE_PIN, esp_random() % 255);
+        // analogWrite(LED_DECORATIVE_PIN, esp_random() % 255);
         // analogWrite(LED_DECORATIVE_PIN2, random(0, 255));
         // analogWrite(LED_DECORATIVE_PIN3, random(0, 255));
         // analogWrite(LED_DECORATIVE_PIN4, random(0, 255));
@@ -1356,7 +1450,7 @@ void generatorTask(void* parameter) {
           rise = onRise_ReglageOK(ReglageOK_filt);
           fall = onFall_ReglageOK(ReglageOK_filt);  // idem : ne l'appelle qu'une fois
 
-          NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (potsOK ? 1 : 0);
+          NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (sw3OK ? 1 : 0);
           RegFalse = 3 - NbTrue;
           // if (turnCount == 0 && !mgHasTarget) {
           //   pickNewTarget();  // choisit une broche
@@ -1392,14 +1486,14 @@ void generatorTask(void* parameter) {
           }
 
           digitalWrite(LED_BUTTON_PIN, LOW);
-          analogWrite(LED_DECORATIVE_PIN, map(turnCount, 0, (NbrTour) + (diffLvl * 2), 0, 255));
+          // analogWrite(LED_DECORATIVE_PIN, map(turnCount, 0, (NbrTour * 2) + (diffLvl * 2), 0, 255));
           // analogWrite(LED_DECORATIVE_PIN2, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
           // analogWrite(LED_DECORATIVE_PIN3, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
           // analogWrite(LED_DECORATIVE_PIN4, map(turnCount, 0, NbrTour + diffLvl, 0, 255));
 
           updateProgressRing(turnCount, (NbrTour) + (diffLvl * 2), 1);  // 🎯 Affichage LED progressif
-                                                                        // 🔹 Détection du capteur secondaire (doit être activé avant le principal)
-          if (digitalRead(MAG_SENSOR_1) == 0 && !capteur2Passe) {       // Anti-rebond
+                                                                            // 🔹 Détection du capteur secondaire (doit être activé avant le principal)
+          if (digitalRead(MAG_SENSOR_1) == 0 && !capteur2Passe) {           // Anti-rebond
             capteur2Passe = true;
             Serial.println("🔸 Capteur secondaire activé !");
           }
@@ -1479,7 +1573,7 @@ void generatorTask(void* parameter) {
           }
           colorFirstHalfGreen(1);
           digitalWrite(LED_BUTTON_PIN, LOW);
-          analogWrite(LED_DECORATIVE_PIN, 255);
+          // analogWrite(LED_DECORATIVE_PIN, 255);
           // analogWrite(LED_DECORATIVE_PIN2, 255);
           // analogWrite(LED_DECORATIVE_PIN3, 255);
           // analogWrite(LED_DECORATIVE_PIN4, 255);
@@ -1488,7 +1582,7 @@ void generatorTask(void* parameter) {
           unsigned long elapsed = millis() - stateStartTime;
           // animateWaitingSimple(stateStartTime, durationMs);
           updateAllMiniGames();
-          NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (potsOK ? 1 : 0);
+          NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (sw3OK ? 1 : 0);
           RegFalse = 3 - NbTrue;
 
           drawMiniGameIndicators();
@@ -1528,7 +1622,7 @@ void generatorTask(void* parameter) {
 
           bool buttonPressed = (digitalRead(GENERATOR_BUTTON_PIN) == LOW);  // LOW = appuyé
           updateAllMiniGames();
-          NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (potsOK ? 1 : 0);
+          NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (sw3OK ? 1 : 0);
           RegFalse = 3 - NbTrue;
 
           drawMiniGameIndicators();
@@ -1586,7 +1680,7 @@ void generatorTask(void* parameter) {
               audioLoop(4);
               JustOnce = true;
             }
-            analogWrite(LED_DECORATIVE_PIN, 255);
+            // analogWrite(LED_DECORATIVE_PIN, 255);
             // analogWrite(LED_DECORATIVE_PIN2, 255);
             // analogWrite(LED_DECORATIVE_PIN3, 255);
             // analogWrite(LED_DECORATIVE_PIN4, 255);
@@ -1635,7 +1729,7 @@ void generatorTask(void* parameter) {
         Killerholding = true;
         Shocked = true;
         digitalWrite(LED_BUTTON_PIN, HIGH);
-        analogWrite(LED_DECORATIVE_PIN, 255);
+        // analogWrite(LED_DECORATIVE_PIN, 255);
         // analogWrite(LED_DECORATIVE_PIN2, 255);
         // analogWrite(LED_DECORATIVE_PIN3, 255);
         // analogWrite(LED_DECORATIVE_PIN4, 255);
@@ -1652,12 +1746,12 @@ void generatorTask(void* parameter) {
         // audioLoop(8);
         animateShockRing();
         updateAllMiniGames();
-        NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (potsOK ? 1 : 0);
+        NbTrue = (crocoOK ? 1 : 0) + (swOK ? 1 : 0) + (sw3OK ? 1 : 0);
         RegFalse = 3 - NbTrue;
         drawMiniGameIndicators();
 
         digitalWrite(LED_BUTTON_PIN, esp_random() % 2);
-        analogWrite(LED_DECORATIVE_PIN, esp_random() % 255);
+        // analogWrite(LED_DECORATIVE_PIN, esp_random() % 255);
         // analogWrite(LED_DECORATIVE_PIN2, random(0, 255));
         // analogWrite(LED_DECORATIVE_PIN3, random(0, 255));
         // analogWrite(LED_DECORATIVE_PIN4, random(0, 255));
@@ -1668,10 +1762,9 @@ void generatorTask(void* parameter) {
         Shocked = true;
         audioStop();
         digitalWrite((LED_BUTTON_PIN), 0);
-        analogWrite(LED_DECORATIVE_PIN, 0);
         indicators.clear();
         ring.clear();
-
+        // analogWrite(LED_DECORATIVE_PIN, 0);
         // analogWrite(LED_DECORATIVE_PIN2, 0);
         // analogWrite(LED_DECORATIVE_PIN3, 0);
         // analogWrite(LED_DECORATIVE_PIN4, 0);
@@ -1710,7 +1803,7 @@ void generatorTask(void* parameter) {
         // pickNewTarget();
         syncTargetsToCurrent(true);  // true = démarre "tout bon" même si croco pas pincé
         digitalWrite((LED_BUTTON_PIN), 0);
-        analogWrite(LED_DECORATIVE_PIN, 0);
+        // analogWrite(LED_DECORATIVE_PIN, 0);
         // analogWrite(LED_DECORATIVE_PIN2, 0);
         // analogWrite(LED_DECORATIVE_PIN3, 0);
         // analogWrite(LED_DECORATIVE_PIN4, 0);
@@ -2286,12 +2379,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
     Phase3Bool = true;
   }
 
-      if (message.endsWith("Door")) {
+    if (message.endsWith("Door")) {
     audioStop();
     audioLoop(15);
   }
-
-
 
   if (message.startsWith(String("Generator:difficulte("))) {
     int startIdx = message.indexOf("(") + 1;
@@ -2353,7 +2444,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     notifyMQTT("on");
   }
 
-      if (message.startsWith("GENERATORREG=")) {
+    if (message.startsWith("GENERATORREG=")) {
     String s = message.substring(strlen("GENERATORREG="));  // ex: "4"
     int t = s.toInt();
 

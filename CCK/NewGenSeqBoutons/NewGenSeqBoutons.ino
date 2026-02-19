@@ -14,7 +14,7 @@ const char* password = "CACHE-CACHEKILLER";
 const char* mqtt_server = "192.168.0.139";
 const char* mqtt_user = "DjiooDanTae";
 const char* mqtt_password = "DjioopPod";
-const char* esp32_id = "Generator4";
+const char* esp32_id = "Generator0";
 
 // WiFi et MQTT
 WiFiClient espClient;
@@ -33,7 +33,7 @@ const int MAG_SENSOR_1 = 27;
 const int MAG_SENSOR_2 = 14;  // 14
 const int GENERATOR_BUTTON_PIN = 23;
 const int LED_BUTTON_PIN = 22;
-const int LED_DECORATIVE_PIN = 5;  //5
+const int LED_DECORATIVE_PIN = 2;  //5
 int RegDiff = 4;
 // const int LED_DECORATIVE_PIN2 = 19;
 // const int LED_DECORATIVE_PIN3 = 18;
@@ -49,10 +49,8 @@ int RegDiff = 4;
 // const int MG_N = sizeof(MG_PORTS) / sizeof(MG_PORTS[0]);
 
 // int mgTargetIdx = -1;  // index du port cible (dans MG_PORTS)
-// bool mgHasTarget = false;
-// --- Pince croco (contacts vers GND, pullup) ---
-const int CROCO_PINS[] = {25, 26, 32, 33 };
-const int CROCO_N = sizeof(CROCO_PINS) / sizeof(CROCO_PINS[0]);
+const uint8_t SEQ_BTN_PINS[3] = { 32, 33, 25 };  // boutons (INPUT_PULLUP)
+const uint8_t SEQ_LED_PINS[3] = { 26, 12, 13 };  // LEDs (OUTPUT) <-- adapte
 
 // --- Interrupteurs (contacts vers GND, pullup) ---
 const int SW_PINS[] = { 18, 19, 21 };
@@ -66,11 +64,11 @@ const bool SW_ACTIVE_LOW = true;
 // #define LED_OK 2
 
 
-#define ANNEAULED 13
+#define ANNEAULED 4
 #define NUM_LEDS 24
 Adafruit_NeoPixel ring(NUM_LEDS, ANNEAULED, NEO_GRB + NEO_KHZ800);
 
-#define IND_PIN 4  // <— choisis une pin dispo
+#define IND_PIN 5  // <— choisis une pin dispo
 #define IND_NUM 3  // 3 voyants: [0]=croco, [1]=switches, [2]=pots
 Adafruit_NeoPixel indicators(IND_NUM, IND_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -274,10 +272,26 @@ enum MiniGameId { MG_CROC,
                   MG_SWITCHES,
                   MG_POTS };
 
-// CROCO
-int crocoTargetIdx = -1;  // index 0..2
-bool crocoOK = false;
-unsigned long crocoLowSince = 0;
+bool crocoOK = true;  // on garde le nom pour ne pas casser tout le code
+
+static bool seqOK = true;
+static uint8_t seq[3] = { 0, 0, 0 };
+static uint8_t seqProgress = 0;
+static bool seqFaultActive = false;
+static bool seqPenalty = false;
+static unsigned long seqPenaltyStart = 0;
+
+static bool seqBlinkOn = false;
+static unsigned long seqLastBlinkMs = 0;
+static const unsigned long SEQ_BLINK_MS = 300;
+static const unsigned long SEQ_ERR_FLASH_MS = 120;
+static const unsigned long SEQ_PENALTY_MS = 2000;
+
+static bool seq_lastRead[3] = { false, false, false };
+static bool seq_stable[3] = { false, false, false };
+static unsigned long seq_changeMs[3] = { 0, 0, 0 };
+static const unsigned long SEQ_DEBOUNCE_MS = 35;
+
 
 // SWITCHES (cible 3 bits 0..7, stabilité 3 s)
 byte swTarget = 0;
@@ -308,9 +322,7 @@ const int POT_OVERSAMPLE = 4;              // x lectures pour réduire le bruit
 const float POT_EMA_ALPHA = 0.25f;         // lissage EMA (0..1)
 
 // ---- Statics de filtrage (à mettre en global, près des états mini-jeux) ----
-// CROCO
-static int croco_lastPin = -1;
-static bool croco_latchedLow = false;
+
 
 // SWITCHES (un petit filtre par broche)
 static bool sw_lastRaw[3] = { false, false, false };
@@ -370,12 +382,139 @@ static inline bool readSwitchPin(int pin) {
   return SW_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
 }
 
+static inline bool seqReadBtnRaw(uint8_t i) {
+  return digitalRead(SEQ_BTN_PINS[i]) == LOW;  // INPUT_PULLUP
+}
+static inline void seqSetLed(uint8_t i, bool on) {
+  digitalWrite(SEQ_LED_PINS[i], on ? HIGH : LOW);
+}
+
+static void seqGenerateNoRepeat() {
+  uint8_t a[3] = { 0, 1, 2 };
+  for (int i = 2; i > 0; i--) {
+    int j = esp_random() % (i + 1);
+    uint8_t t = a[i];
+    a[i] = a[j];
+    a[j] = t;
+  }
+  seq[0] = a[0];
+  seq[1] = a[1];
+  seq[2] = a[2];
+}
+
+static void seqStartFault() {
+  seqGenerateNoRepeat();
+  seqProgress = 0;
+  seqOK = false;
+  crocoOK = false;
+  seqFaultActive = true;
+
+  seqPenalty = false;
+  seqPenaltyStart = 0;
+
+  seqBlinkOn = false;
+  seqLastBlinkMs = millis();
+
+  for (int i = 0; i < 3; i++) seqSetLed(i, false);
+
+  Serial.printf("[SEQ] Nouvelle séquence: %d-%d-%d\n", seq[0] + 1, seq[1] + 1, seq[2] + 1);
+}
+
+static void seqMarkSuccess() {
+  seqOK = true;
+  crocoOK = true;
+  seqFaultActive = false;
+  seqPenalty = false;
+  for (int i = 0; i < 3; i++) seqSetLed(i, true);
+}
+
+static bool seqBtnPressedEvent(uint8_t i, unsigned long now) {
+  bool r = seqReadBtnRaw(i);
+
+  if (r != seq_lastRead[i]) {
+    seq_lastRead[i] = r;
+    seq_changeMs[i] = now;
+  }
+
+  if ((now - seq_changeMs[i]) >= SEQ_DEBOUNCE_MS) {
+    if (seq_stable[i] != seq_lastRead[i]) {
+      seq_stable[i] = seq_lastRead[i];
+      if (seq_stable[i] == true) return true;
+    }
+  }
+  return false;
+}
+
+static void seqUpdateLEDs(unsigned long now) {
+  if (!seqFaultActive) {
+    if (seqOK) {
+      for (int i = 0; i < 3; i++) seqSetLed(i, true);
+    } else {
+      for (int i = 0; i < 3; i++) seqSetLed(i, false);
+    }
+    return;
+  }
+
+  unsigned long period = seqPenalty ? SEQ_ERR_FLASH_MS : SEQ_BLINK_MS;
+  if (now - seqLastBlinkMs >= period) {
+    seqLastBlinkMs = now;
+    seqBlinkOn = !seqBlinkOn;
+  }
+
+  if (seqPenalty) {
+    for (int i = 0; i < 3; i++) seqSetLed(i, seqBlinkOn);
+    return;
+  }
+
+  bool validated[3] = { false, false, false };
+  for (int k = 0; k < seqProgress; k++) validated[seq[k]] = true;
+
+  for (int i = 0; i < 3; i++) {
+    if (validated[i]) seqSetLed(i, true);
+    else seqSetLed(i, seqBlinkOn);
+  }
+}
+
+static void seqUpdateLogic(unsigned long now) {
+  if (seqPenalty) {
+    if (now - seqPenaltyStart >= SEQ_PENALTY_MS) {
+      seqPenalty = false;
+      seqBlinkOn = false;
+      seqLastBlinkMs = now;
+    }
+    return;
+  }
+
+  if (!seqFaultActive) return;
+
+  for (int i = 0; i < 3; i++) {
+    if (seqBtnPressedEvent(i, now)) {
+      uint8_t expected = seq[seqProgress];
+      if (i == expected) {
+        seqProgress++;
+        if (seqProgress >= 3) {
+          seqMarkSuccess();
+        }
+      } else {
+        seqProgress = 0;
+        seqPenalty = true;
+        seqPenaltyStart = now;
+      }
+    }
+  }
+}
+
+
 void initAllTargets() {
   // Croco: choisir une borne
-  crocoTargetIdx = esp_random() % CROCO_N;
-  crocoOK = false;
-  crocoLowSince = 0;
-  Serial.printf("[Init] Croco cible GPIO %d\n", CROCO_PINS[crocoTargetIdx]);
+  seqOK = true;
+  crocoOK = true;
+  seqFaultActive = false;
+  seqPenalty = false;
+  seqProgress = 0;
+  for (int i = 0; i < 3; i++) seqSetLed(i, true);
+  Serial.println("[Init] Sequence OK (pas de panne)");
+
 
   // Switches: 3 bits
   swTarget = ((byte)(esp_random() % 8));
@@ -399,13 +538,7 @@ void pickNewTarget(int id = -1) {
   switch ((MiniGameId)id) {
     case MG_CROC:
       {
-        int old = crocoTargetIdx;
-        int idx;
-        do { idx = esp_random() % CROCO_N; } while (CROCO_N > 1 && idx == old);
-        crocoTargetIdx = idx;
-        crocoOK = false;
-        crocoLowSince = 0;
-        Serial.printf("[Target] Croco -> GPIO %d\n", CROCO_PINS[crocoTargetIdx]);
+        seqStartFault();  // déclenche la panne séquence + génère la suite
       }
       break;
 
@@ -440,43 +573,12 @@ void pickNewTarget(int id = -1) {
 void updateAllMiniGames() {
   unsigned long now = millis();
 
-  // ----- CROCO -----
-  // ---------------- CROCO ----------------
+
+  // ----- SEQUENCE (remplace CROCO) -----
   {
-    const int pin = CROCO_PINS[crocoTargetIdx];
-    // (1) Réaffirme PULLUP chaque passe
-    pinMode(pin, INPUT_PULLUP);
-
-    // (2) Triple sample ultracourt pour lisser
-    bool sampleLow = (digitalRead(pin) == LOW);
-    if (sampleLow) {
-      for (int i = 0; i < 3; ++i) {
-        delayMicroseconds(300);
-        if (digitalRead(pin) != LOW) {
-          sampleLow = false;
-          break;
-        }
-      }
-    }
-
-    // (3) Latch + temporisation (exactement ton mgUpdateLED)
-    if (pin != croco_lastPin) {
-      croco_latchedLow = false;
-      crocoLowSince = 0;
-      croco_lastPin = pin;
-    }
-
-    if (sampleLow) {
-      if (!croco_latchedLow) {
-        croco_latchedLow = true;
-        crocoLowSince = now;
-      }
-    } else {
-      croco_latchedLow = false;
-      crocoLowSince = 0;
-    }
-
-    crocoOK = (croco_latchedLow && (now - crocoLowSince >= CROCO_HOLD_MS));
+    seqUpdateLEDs(now);
+    seqUpdateLogic(now);
+    crocoOK = seqOK;
   }
 
   // ----- SWITCHES -----
@@ -551,52 +653,12 @@ void syncTargetsToCurrent(bool forceOK = true) {
   unsigned long now = millis();
 
   // ---------------- CROCO : choisir le pin actuellement au GND si possible ----------------
-  int foundIdx = -1;
-
-  // petite recherche "stable" (évite un spike)
-  for (int i = 0; i < CROCO_N; ++i) {
-    int pin = CROCO_PINS[i];
-    pinMode(pin, INPUT_PULLUP);
-
-    // on cherche un LOW qui tient un minimum
-    bool low = (digitalRead(pin) == LOW);
-    if (low) {
-      delayMicroseconds(300);
-      low = (digitalRead(pin) == LOW);
-      if (low) {
-        foundIdx = i;
-        break;
-      }
-    }
-  }
-
-  if (foundIdx >= 0) {
-    crocoTargetIdx = foundIdx;
-    // on "valide" proprement le latch
-    croco_lastPin = CROCO_PINS[crocoTargetIdx];
-    croco_latchedLow = true;
-    crocoLowSince = now - CROCO_HOLD_MS;  // considéré stable
-    crocoOK = true;
-  } else {
-    // si rien n’est pincé, tu as 2 options :
-    // - forceOK=true : on démarre quand même "OK" (c’est ce que tu demandes)
-    // - forceOK=false : on démarre "pas OK" tant que personne ne pince
-    if (forceOK) {
-      // garde une cible quelconque, mais démarre en OK
-      if (crocoTargetIdx < 0) crocoTargetIdx = 0;
-      croco_lastPin = CROCO_PINS[crocoTargetIdx];
-      croco_latchedLow = true;
-      crocoLowSince = now - CROCO_HOLD_MS;
-      crocoOK = true;
-    } else {
-      if (crocoTargetIdx < 0) crocoTargetIdx = 0;
-      croco_lastPin = CROCO_PINS[crocoTargetIdx];
-      croco_latchedLow = false;
-      crocoLowSince = 0;
-      crocoOK = false;
-    }
-  }
-
+  seqOK = true;
+  crocoOK = true;
+  seqFaultActive = false;
+  seqPenalty = false;
+  seqProgress = 0;
+  for (int i = 0; i < 3; i++) seqSetLed(i, true);
   // ---------------- SWITCHES : cible = combinaison actuelle ----------------
   bool s0 = readSwitchPin(SW_PINS[0]);
   bool s1 = readSwitchPin(SW_PINS[1]);
@@ -626,8 +688,7 @@ void syncTargetsToCurrent(bool forceOK = true) {
   drawMiniGameIndicators();  // voyants verts
   JustOnce = false;
 
-  Serial.printf("[SYNC] Croco GPIO=%d | Switches=%d%d%d | Pots somme=%d\n",
-                CROCO_PINS[crocoTargetIdx],
+  Serial.printf("[SYNC] Sequence OK | Switches=%d%d%d | Pots somme=%d\n",
                 (swTarget >> 2) & 1, (swTarget >> 1) & 1, swTarget & 1,
                 potTarget);
 }
@@ -885,7 +946,12 @@ void setup() {
   // --- MINI-JEUX I/O ---
   // pinMode(LED_OK, OUTPUT);
   // digitalWrite(LED_OK, LOW);
-  for (int i = 0; i < CROCO_N; ++i) pinMode(CROCO_PINS[i], INPUT_PULLUP);
+  for (int i = 0; i < 3; i++) {
+    pinMode(SEQ_BTN_PINS[i], INPUT_PULLUP);
+    pinMode(SEQ_LED_PINS[i], OUTPUT);
+    digitalWrite(SEQ_LED_PINS[i], LOW);
+  }
+
   for (int i = 0; i < SW_N; ++i) pinMode(SW_PINS[i], INPUT_PULLUP);
   pinMode(POT1, INPUT);
   pinMode(POT2, INPUT);
@@ -1438,13 +1504,13 @@ void generatorTask(void* parameter) {
             //   JustOnce = false;
             // }
             // stopLoopTrack();
-            if (RegFalse < 3){
-            int randomPick = esp_random() % RegDiff;
-            if (randomPick <= RegFalse) {
-              pickNewTarget();
-              updateAllMiniGames();
-              JustOnce = false;
-            }
+            if (RegFalse < 3) {
+              int randomPick = esp_random() % RegDiff;
+              if (randomPick <= RegFalse) {
+                pickNewTarget();
+                updateAllMiniGames();
+                JustOnce = false;
+              }
             }
           }
 
@@ -1671,7 +1737,6 @@ void generatorTask(void* parameter) {
         analogWrite(LED_DECORATIVE_PIN, 0);
         indicators.clear();
         ring.clear();
-
         // analogWrite(LED_DECORATIVE_PIN2, 0);
         // analogWrite(LED_DECORATIVE_PIN3, 0);
         // analogWrite(LED_DECORATIVE_PIN4, 0);
@@ -1711,6 +1776,7 @@ void generatorTask(void* parameter) {
         syncTargetsToCurrent(true);  // true = démarre "tout bon" même si croco pas pincé
         digitalWrite((LED_BUTTON_PIN), 0);
         analogWrite(LED_DECORATIVE_PIN, 0);
+        Phase3Bool = false;
         // analogWrite(LED_DECORATIVE_PIN2, 0);
         // analogWrite(LED_DECORATIVE_PIN3, 0);
         // analogWrite(LED_DECORATIVE_PIN4, 0);
@@ -1729,7 +1795,6 @@ void generatorTask(void* parameter) {
         audioLoop(1);
         // vTaskDelay(2000 / portTICK_PERIOD_MS);
         notifyMQTT("generateur lvl 1");
-        Phase3Bool = false;
         genState = COUNTING;
         break;
     }
@@ -2286,7 +2351,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     Phase3Bool = true;
   }
 
-      if (message.endsWith("Door")) {
+  if (message.endsWith("Door")) {
     audioStop();
     audioLoop(15);
   }
@@ -2353,7 +2418,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     notifyMQTT("on");
   }
 
-      if (message.startsWith("GENERATORREG=")) {
+  if (message.startsWith("GENERATORREG=")) {
     String s = message.substring(strlen("GENERATORREG="));  // ex: "4"
     int t = s.toInt();
 
@@ -2363,6 +2428,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
     RegDiff = t;
   }
 }
+
+
 
 // Notifier le serveur MQTT
 void notifyMQTT(const char* message) {

@@ -29,11 +29,15 @@ static int8_t dir = 4;         // direction (+/-)
 static uint32_t lastStep = 0;  // chrono
 
 // ---------- IR ----------
-#define IR_SEND_PIN 14
+#define IR_SEND_PIN 4
 const uint16_t irIddle = 0x0000;  // code que le gilet reconnaît
-uint16_t irShoot = 0x0001;
+uint16_t irShoot = 0x1001;
 const uint8_t irCmd = 0xA9;
 int Cooldown = 10000;
+
+int lvl1Req = 4;
+int lvl2Req = 10;
+int lvl3Req = 20;
 
 // --- Flash blanc x3 (non bloquant) ---
 bool flashing = false;
@@ -55,16 +59,17 @@ bool Find = false;
 bool lvlup1 = false;
 bool lvlup2 = false;
 bool lvlup3 = false;
+int BorneMunitionRecup = 1;
 
 // --- Charge (appui maintenu) ---
 bool isCharging = false;
 unsigned long chargeStart = 0;
 const uint16_t CHARGE_MS = 1000;  // temps à maintenir avant tir (ajuste)
-bool prevPressed = false;         // mémorise l'état précédent du bouton
+// bool prevPressed = false;         // mémorise l'état précédent du bouton
 
 
 // ---------- LED Ring ----------
-#define RING_PIN 27
+#define RING_PIN 14
 #define NUM_LEDS 12
 Adafruit_NeoPixel ring(NUM_LEDS, RING_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -115,8 +120,8 @@ volatile int ammoRSSI = -127;        // dernier RSSI consolidé
 volatile uint32_t ammoLastSeen = 0;  // timestamp dernière vue
 
 // Seuils
-constexpr int RSSI_ENTER = -80;  // entrer dans la zone
-constexpr int RSSI_EXIT = -100;  // sortir de la zone (un peu plus bas que ENTER)
+constexpr int RSSI_ENTER = -58;  // entrer dans la zone
+constexpr int RSSI_EXIT = -62;   // sortir de la zone (un peu plus bas que ENTER)
 constexpr uint32_t AMMO_TIMEOUT_MS = 5000;
 
 // Meilleur RSSI observé durant le scan en cours (réinitialisé à chaque passe)
@@ -161,8 +166,8 @@ volatile int dfp_next = -1;
 volatile bool dfp_next_loop = false;
 volatile uint32_t dfp_started_ms = 0;
 
-const uint32_t DFP_GAP_MS = 300;          // délai entre 2 trames
-const uint32_t DFP_WATCHDOG_MS = 180000;  // 3 min secours si pas d’événement
+const uint32_t DFP_GAP_MS = 500;        // délai entre 2 trames
+const uint32_t DFP_WATCHDOG_MS = 8000;  // 3 min secours si pas d’événement
 
 static void dfpStartNow(int track, bool loop) {
   if (loop) myDFPlayer.loop(track);
@@ -247,8 +252,8 @@ void setup() {
 
   // Tasks FreeRTOS
   xTaskCreatePinnedToCore(networkTask, "NetworkTask", 8192, NULL, 1, &networkTaskHandle, 0);
-  xTaskCreatePinnedToCore(irTask, "IrTask", 8192, NULL, 3, &irTaskHandle, 1);
-  xTaskCreatePinnedToCore(audioTask, "AudioTask", 4096, NULL, 2, &audioTaskHandle, 1);
+  xTaskCreatePinnedToCore(irTask, "IrTask", 8192, NULL, 2, &irTaskHandle, 1);
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 8192, NULL, 3, &audioTaskHandle, 1);
   xTaskCreatePinnedToCore(bleScanTask, "BLEScanTask", 4096, NULL, 1, &bleScanTaskHandle, 0);
 }
 
@@ -405,7 +410,7 @@ void irTask(void* parameter) {
     // }
 
 
-    if (millis() - lastIR > 100 && !Shooting && !isCharging && millis() - LastShoot > Cooldown) {
+    if (millis() - lastIR > 100 && !isCharging && millis() - LastShoot > Cooldown) {
       IrSender.sendNEC(irIddle, irCmd, 1);  // 1 trame + 2 repeats NEC (identique à ton code)
       lastIR = millis();
     }
@@ -421,7 +426,7 @@ void irTask(void* parameter) {
       ring.show();
     }
 
-    if (millis() - NowS > 3000 && startVib && digitalRead(BUTTON_PIN) == HIGH && !Find) {
+    if (millis() - NowS > 3000 && startVib && !Find) {
       StopVibration();
       startVib = false;
     }
@@ -451,9 +456,15 @@ void irTask(void* parameter) {
       LastRecharge = millis();
     }
 
+    if (munitions >= TotalMunition) {
+      borneMunition = false;
+    }
+
     if (borneMunition && millis() - borneTime > 20000) {
-      munitions = TotalMunition;
+      // munitions = TotalMunition;
+      munitions += BorneMunitionRecup;
       borneTime = millis();
+      borneMunition = false;
     }
 
     // démarrage de charge si possible (pas en cooldown, pas déjà en charge)
@@ -469,7 +480,7 @@ void irTask(void* parameter) {
       unsigned long elapsed = millis() - chargeStart;
 
       // si on relâche AVANT la fin -> annule
-      if (!pressed) {
+      if (!pressed && elapsed < CHARGE_MS) {
         isCharging = false;
         audioStop();
         ring.fill(ring.Color(255, 0, 0), 0, NUM_LEDS);
@@ -492,10 +503,10 @@ void irTask(void* parameter) {
         // charge complète -> TIR auto (tant que le bouton reste appuyé)
         if (elapsed >= CHARGE_MS) {
           isCharging = false;
-          Shooting = true;
+          // Shooting = true;
           LastShoot = millis();
           StopVibration();
-          Shooting = false;
+          // Shooting = false;
           if (munitions == TotalMunition) {
             LastRecharge = millis();
           }
@@ -508,7 +519,7 @@ void irTask(void* parameter) {
     }
 
     // mémorise l'état (utile si tu veux déclencher au relâchement)
-    prevPressed = pressed;
+    // prevPressed = pressed;
 
 
     // if (Shooting && millis() - LastShoot > 100) {
@@ -548,44 +559,48 @@ void irTask(void* parameter) {
     //   }
     // }
 
-    if (Ame >= 50) {
+    if (Ame >= lvl3Req) {
       Cooldown = 4000;
-      Recharge = 15000;
+      Recharge = 30000;
       TotalMunition = 6;
       irShoot = 0x1003;
+      BorneMunitionRecup = 3;
       if (!lvlup3) {
         audioPlay(6);
         lvlup3 = true;
       }
     }
 
-    else if (Ame >= 25) {
+    else if (Ame >= lvl2Req) {
       Cooldown = 6000;
-      Recharge = 20000;
+      Recharge = 40000;
       TotalMunition = 5;
       irShoot = 0x1002;
+      BorneMunitionRecup = 2;
       if (!lvlup2) {
         audioPlay(6);
         lvlup2 = true;
       }
     }
 
-    else if (Ame >= 10) {
+    else if (Ame >= lvl1Req) {
       Cooldown = 8000;
-      Recharge = 30000;
+      Recharge = 50000;
       TotalMunition = 4;
       irShoot = 0x1001;
+      BorneMunitionRecup = 1;
       if (!lvlup1) {
         audioPlay(6);
         lvlup1 = true;
       }
     }
 
-    else if (Ame < 10) {
+    else {
       Cooldown = 10000;
-      Recharge = 40000;
+      Recharge = 60000;
       TotalMunition = 3;
       irShoot = 0x1001;
+      BorneMunitionRecup = 1;
     }
   }
 }
@@ -667,8 +682,10 @@ void chargeVibration(float t) {
 
 void onAmmoProximityStart() {
   Serial.println("[Ammo] PROXIMITY START (≤ -80 dBm)");
-  borneMunition = true;
-  borneTime = millis();
+  if (munitions < TotalMunition) {
+    borneMunition = true;
+    borneTime = millis();
+  }
 
   // EXEMPLES — à adapter :
   // audioPlay(TRACK_FIND);
@@ -678,7 +695,7 @@ void onAmmoProximityStart() {
 
 void onAmmoProximityStop() {
   Serial.println("[Ammo] PROXIMITY STOP (> -83 dBm ou timeout)");
-  borneMunition = false;
+  // borneMunition = false;
   // EXEMPLES — à adapter :
   // audioStop();
   // StopVibration();
@@ -708,10 +725,10 @@ void renderMunitionBase() {
   RubLed.show();
 
   if (borneMunition) {
-    int f = constrain(TotalMunition, munitions, RUB_LEDS);
+    int f = constrain((munitions + BorneMunitionRecup), munitions, RUB_LEDS);
     {
       for (int y = munitions; y < f; y++) {
-        RubLed.setPixelColor(y, RubLed.Color(breath, breath/3, 0));
+        RubLed.setPixelColor(y, RubLed.Color(breath, breath / 3, 0));
       }
       RubLed.show();
     }
@@ -729,12 +746,13 @@ void callback(char* topic, byte* payload, unsigned int length) {
     Serial.println("[RESET] remise à zéro");
     Ame = 0;
     Cooldown = 10000;
-    Recharge = 30000;
+    Recharge = 60000;
     TotalMunition = 3;
     irShoot = 0x0001;
     lvlup1 = false;
     lvlup2 = false;
     lvlup3 = false;
+    RubLed.clear();
   }
 
   if (msg.endsWith("FIND")) {
@@ -759,5 +777,36 @@ void callback(char* topic, byte* payload, unsigned int length) {
     audioPlay(5);
     Vibration(255);
     Ame += 3;
+  }
+
+  if (msg.endsWith("LOOSE")) {
+    audioPlay(7);
+  }
+
+  if (msg.endsWith("WIN")) {
+    audioPlay(8);
+  }
+
+  if (msg.startsWith("LANTERN_THRESH=")) {
+    String s = msg.substring(strlen("LANTERN_THRESH="));  // "4,10,20"
+    int c1 = s.indexOf(',');
+    int c2 = s.indexOf(',', c1 + 1);
+
+    if (c1 > 0 && c2 > c1) {
+      int t1 = s.substring(0, c1).toInt();
+      int t2 = s.substring(c1 + 1, c2).toInt();
+      int t3 = s.substring(c2 + 1).toInt();
+
+      // garde-fous
+      if (t1 < 0) t1 = 0;
+      if (t2 <= t1) t2 = t1 + 1;
+      if (t3 <= t2) t3 = t2 + 1;
+
+      lvl1Req = t1;
+      lvl2Req = t2;
+      lvl3Req = t3;
+
+      Serial.printf("[LANTERN] thresholds set: %d / %d / %d\n", lvl1Req, lvl2Req, lvl3Req);
+    }
   }
 }
